@@ -143,3 +143,67 @@ def image_to_world(H: np.ndarray, uv: np.ndarray) -> np.ndarray:
     Returns (N, 2) ground coordinates (X, Y) in meters.
     """
     return apply_homography(H, uv)
+
+
+def _similarity_normalize(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Hartley normalization: centroid at the origin, mean distance sqrt(2).
+
+    Returns the normalized (N, 2) points and the 3x3 similarity T with
+    x_normalized_homogeneous = T @ x_homogeneous.
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 2:
+        raise ValueError(f"points must have shape (N, 2), got {pts.shape}")
+    centroid = pts.mean(axis=0)
+    centered = pts - centroid
+    mean_distance = float(np.mean(np.linalg.norm(centered, axis=1)))
+    if mean_distance < 1e-12:
+        raise ValueError("Cannot normalize a point set whose points are identical.")
+    scale = np.sqrt(2.0) / mean_distance
+    transform = np.array(
+        [
+            [scale, 0.0, -scale * centroid[0]],
+            [0.0, scale, -scale * centroid[1]],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    return centered * scale, transform
+
+
+def normalized_dlt(src_pts: np.ndarray, dst_pts: np.ndarray) -> np.ndarray:
+    """Estimate a homography with the normalized direct linear transform.
+
+    Following Hartley and Zisserman: normalize each point set so its centroid
+    is the origin and its mean distance from the origin is sqrt(2), build the
+    2N x 9 DLT matrix, and take the singular vector for the smallest singular
+    value. The homography is then denormalized and scaled so H[2, 2] = 1.
+    src_pts and dst_pts are (N, 2) with N >= 4. N > 4 is least squares.
+    The result maps source points to destination points.
+    """
+    src = np.asarray(src_pts, dtype=np.float64)
+    dst = np.asarray(dst_pts, dtype=np.float64)
+    if src.shape != dst.shape or src.ndim != 2 or src.shape[1] != 2:
+        raise ValueError(f"src_pts and dst_pts must both have shape (N, 2), got {src.shape} and {dst.shape}")
+    if len(src) < 4:
+        raise ValueError(f"Normalized DLT needs at least 4 correspondences, got {len(src)}")
+    src_n, src_transform = _similarity_normalize(src)
+    dst_n, dst_transform = _similarity_normalize(dst)
+
+    count = len(src_n)
+    x = src_n[:, 0]
+    y = src_n[:, 1]
+    u = dst_n[:, 0]
+    v = dst_n[:, 1]
+    design = np.zeros((2 * count, 9), dtype=np.float64)
+    # x' × H x = 0, two independent rows per correspondence.
+    design[0::2, 3:6] = np.column_stack((-x, -y, -np.ones(count)))
+    design[0::2, 6:9] = np.column_stack((v * x, v * y, v))
+    design[1::2, 0:3] = np.column_stack((x, y, np.ones(count)))
+    design[1::2, 6:9] = np.column_stack((-u * x, -u * y, -u))
+    # full_matrices=True keeps the right null-space vector. For N = 4 the
+    # design matrix is 8 x 9, and the economy SVD drops that vector.
+    _singular_values, _left, vh = np.linalg.svd(design, full_matrices=True)
+    homography_normalized = vh[-1].reshape(3, 3)
+    homography = np.linalg.inv(dst_transform) @ homography_normalized @ src_transform
+    return _normalize_homography(homography)
