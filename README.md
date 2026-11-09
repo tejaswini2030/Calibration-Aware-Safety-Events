@@ -95,7 +95,13 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Requires Python 3 with numpy, opencv-python, pandas, matplotlib, pyyaml, tqdm, and pytest.
+Requires Python 3 with numpy, opencv-python, pandas, matplotlib, pyyaml, scipy, tqdm, and pytest.
+
+Detection and tracking need extra packages (YOLO, ByteTrack, DeepSORT). A GPU makes detection much faster:
+
+```bash
+pip install -r requirements-detect.txt
+```
 
 ## Repository layout
 
@@ -108,10 +114,12 @@ src/
   evaluation.py       event matching and precision / recall / F1
   perturb.py          calibration points, pixel perturbation, single trial
   viz.py              plots and overlays
+  tracking.py         frame list, detection/track CSV format, tracker wrappers, box-level tracking scores
 scripts/              runnable checks and experiments (below)
 tests/                pytest suite
 data/                 dataset (gitignored)
 outputs/              results and plots (gitignored)
+results/              detection and track CSVs (committed, small)
 docs/figures/         selected plots committed for this README
 ```
 
@@ -137,9 +145,37 @@ python scripts/check_zero_noise.py
 # 4. The calibration sweep (5 noise levels × 200 trials, multiprocessing)
 python scripts/run_sweep.py             # → outputs/sweep_C1_gt_tracks.csv and plots
 
+# 5. Detection and tracking (needs requirements-detect.txt)
+python scripts/run_detection.py         # → results/detections/det_C1_{yolo11n,yolo11x}.csv
+python scripts/run_tracking.py          # → results/tracks/tracks_C1_<detector>_<tracker>.csv (4 files)
+python scripts/check_tracks.py          # → results/tracks/tracking_summary_C1.csv, idmap_*.csv, overlay_*.png
+
 # Tests
 python -m pytest
 ```
+
+## Detection and tracking
+
+Two detectors (YOLO11n, small and fast; YOLO11x, large and accurate) run on the 400 annotated C1 frames, keeping only the person class. Each detection file is then tracked with two trackers: **ByteTrack** (motion and box overlap only, also uses low-score boxes) and **DeepSORT** (adds an appearance embedding per box). That gives 4 track files.
+
+**Track CSV format.** One row per tracked person per frame, boxes in original 1920 × 1080 pixels:
+
+| Column | Meaning |
+|---|---|
+| `frame_idx` | 0–399, same as `load_annotations` |
+| `frame_number` | annotation file number (steps of 5) |
+| `time_sec` | `frame_idx / 2` |
+| `track_id` | tracker's ID for the person (not a ground-truth `person_id`) |
+| `xmin, ymin, xmax, ymax` | box corners in pixels |
+| `score` | detector confidence of the matched box |
+
+The foot point for the homography is the bottom-center of the box: `((xmin + xmax) / 2, ymax)`.
+
+**Linking track IDs to people.** Event matching compares identities, but `track_id` and `person_id` are different numbers. `scripts/check_tracks.py` matches boxes to ground-truth boxes in every frame (Hungarian, IoU ≥ 0.5) and writes `idmap_C1_<detector>_<tracker>.csv`: for each track, the person it overlapped most often and its purity (share of its frames on that person).
+
+**Settings.** Detector confidence ≥ 0.1 and image size 1280 (far people are small). Both trackers keep a lost track for 2 s (4 frames at 2 fps). DeepSORT only receives boxes with score ≥ 0.3 and confirms a track after 2 frames.
+
+**Tracking scores** (`tracking_summary_C1.csv`): detection precision and recall at IoU ≥ 0.5, mean IoU, CLEAR-MOT ID switches, MOTA, and the number of track IDs against the number of people.
 
 ## Method
 
@@ -200,7 +236,8 @@ Dwell fires when a zone visit lasts at least `dwell_seconds`; the alarm starts a
 
 - [ ] Threshold-distance analysis (test Finding 4) and dwell-failure breakdown
 - [ ] Add ε = 2 px for a finer guideline
-- [ ] Detector comparison (2–3 models) and tracker comparison (2–3 trackers), incl. ID switches
+- [x] Detection (YOLO11n, YOLO11x) and tracking (ByteTrack, DeepSORT) on C1, with box-level scores and ID switches
+- [ ] Event F1 on predicted tracks for the 4 detector × tracker combinations
 - [ ] Foot point: box bottom-center vs pose-model ankles
 - [ ] Camera bump (small rotations) and calibration-layout experiments
 - [ ] More than 4 points as a mitigation
