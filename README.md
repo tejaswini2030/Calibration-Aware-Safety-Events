@@ -148,7 +148,9 @@ python scripts/run_sweep.py             # → outputs/sweep_C1_gt_tracks.csv and
 # 5. Detection and tracking (needs requirements-detect.txt)
 python scripts/run_detection.py         # → results/detections/det_C1_{yolo11n,yolo11x}.csv
 python scripts/run_tracking.py          # → results/tracks/tracks_C1_<detector>_<tracker>.csv (4 files)
-python scripts/check_tracks.py          # → results/tracks/tracking_summary_C1.csv, idmap_*.csv, overlay_*.png
+python scripts/check_tracks.py          # → results/tracks/tracking_summary_C1.csv, idmap_*.csv; overlays in outputs/tracks/
+python scripts/diagnose_foot_points.py  # oracle, histogram, bias, error breakdown, invisible no_person check, loose tracker sensitivity
+python scripts/run_events_on_tracks.py  # → outputs/events_on_tracks_C1.csv (+ gt proximity inner)
 
 # Tests
 python -m pytest
@@ -171,11 +173,11 @@ Two detectors (YOLO11n, small and fast; YOLO11x, large and accurate) run on the 
 
 The foot point for the homography is the bottom-center of the box: `((xmin + xmax) / 2, ymax)`.
 
-**Linking track IDs to people.** Event matching compares identities, but `track_id` and `person_id` are different numbers. `scripts/check_tracks.py` matches boxes to ground-truth boxes in every frame (Hungarian, IoU ≥ 0.5) and writes `idmap_C1_<detector>_<tracker>.csv`: for each track, the person it overlapped most often and its purity (share of its frames on that person).
+**Linking track IDs to people.** Event matching compares identities, but `track_id` and `person_id` are different numbers. `scripts/check_tracks.py` projects each box bottom-center with H* and matches feet to annotated ground positions (Hungarian, within 0.5 m). It writes `idmap_C1_<detector>_<tracker>.csv`: for each track, the person it matched most often and its purity. A track that never matches gets its own negative id, `-track_id`. Box IoU ≥ 0.5 is still reported beside those scores. Overlay images go to `outputs/tracks/`.
 
 **Settings.** Detector confidence ≥ 0.1 and image size 1280 (far people are small). Both trackers keep a lost track for 2 s (4 frames at 2 fps). DeepSORT only receives boxes with score ≥ 0.3 and confirms a track after 2 frames.
 
-**Tracking scores** (`tracking_summary_C1.csv`): detection precision and recall at IoU ≥ 0.5, mean IoU, CLEAR-MOT ID switches, MOTA, and the number of track IDs against the number of people.
+**Tracking scores** (`tracking_summary_C1.csv`): detection precision and recall, CLEAR-MOT ID switches, MOTA, and track purity, once for box IoU ≥ 0.5 and once for ground-plane feet within 0.5 m. Feet outside the 12 m × 36 m annotated ground rectangle are dropped before the ground-plane scores. The main ground-plane table then applies a 1 m boundary don't-care margin (margin 0 is saved beside it): unmatched feet in that edge band are ignored.
 
 ## Method
 

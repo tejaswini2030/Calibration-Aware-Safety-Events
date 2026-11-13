@@ -19,8 +19,18 @@ from src.tracking import (
     box_iou,
     count_id_switches,
     detection_rows,
+    classify_distant_feet,
+    classify_missed_people,
+    drop_outside_ground_area,
+    ground_error_components,
+    in_ground_area,
     match_frame,
+    match_frame_ground,
     match_tracks_to_gt,
+    nearest_gt_distance,
+    recall_by_camera_distance,
+    tracking_summary_ground,
+    relabel_tracks,
     run_tracker,
     save_csv,
     track_to_person_map,
@@ -122,7 +132,165 @@ def test_false_positive_lowers_precision() -> None:
     summary = tracking_summary(pd.concat([tracks, extra], ignore_index=True), gt)
     assert summary["det_precision"] == pytest.approx(4 / 5)
     mapping = track_to_person_map(match_tracks_to_gt(pd.concat([tracks, extra]), gt), pd.concat([tracks, extra]))
-    assert int(mapping.loc[mapping["track_id"] == 5, "person_id"].iloc[0]) == -1
+    assert int(mapping.loc[mapping["track_id"] == 5, "person_id"].iloc[0]) == -5
+
+
+def test_ground_area_filter_drops_a_point_at_x_20() -> None:
+    tracks = pd.DataFrame({"X_m": [1.0, 20.0, 9.0], "Y_m": [0.0, 0.0, 27.0]})
+    kept, dropped = drop_outside_ground_area(tracks)
+    assert dropped == 1
+    assert kept["X_m"].tolist() == [1.0, 9.0]
+
+
+def test_boundary_margin_ignores_unmatched_edge_feet() -> None:
+    """A false foot on the X = -3 m edge is ignored once the 1 m band is applied."""
+    gt = pd.DataFrame(
+        {
+            "frame_idx": [0],
+            "person_id": [1],
+            "X_m": [5.0],
+            "Y_m": [10.0],
+        }
+    )
+    tracks = pd.DataFrame(
+        {
+            "frame_idx": [0, 0],
+            "track_id": [1, 2],
+            "X_m": [5.1, -2.9],
+            "Y_m": [10.0, 10.0],
+            "score": [0.9, 0.9],
+        }
+    )
+    full = tracking_summary_ground(tracks, gt, max_dist_m=0.5, boundary_margin_m=0.0)
+    assert full["det_precision"] == pytest.approx(0.5)
+    assert full["det_recall"] == pytest.approx(1.0)
+    assert full["ignored_pred"] == 0
+
+    inset = tracking_summary_ground(tracks, gt, max_dist_m=0.5, boundary_margin_m=1.0)
+    assert inset["det_precision"] == pytest.approx(1.0)
+    assert inset["det_recall"] == pytest.approx(1.0)
+    assert inset["ignored_pred"] == 1
+    assert inset["mota"] == pytest.approx(1.0)
+    assert in_ground_area([-2.9], [10.0], margin_m=0.0)[0]
+    assert not in_ground_area([-2.9], [10.0], margin_m=1.0)[0]
+
+
+def test_match_frame_ground_keeps_0_3_m_and_rejects_0_7_m() -> None:
+    pred = np.array([[0.0, 0.0], [2.0, 0.0]])
+    gt = np.array([[0.3, 0.0], [2.7, 0.0]])
+    assert match_frame_ground(pred, gt, 0.5) == [(0, 0)]
+
+
+def test_nearest_gt_distance_stays_inside_its_frame() -> None:
+    tracks = pd.DataFrame(
+        {
+            "frame_idx": [0, 0, 1],
+            "X_m": [0.0, 3.0, 0.0],
+            "Y_m": [0.0, 0.0, 0.0],
+        }
+    )
+    gt = pd.DataFrame(
+        {
+            "frame_idx": [0, 0, 1],
+            "X_m": [0.2, 10.0, 5.0],
+            "Y_m": [0.0, 0.0, 0.0],
+        }
+    )
+    assert np.allclose(nearest_gt_distance(tracks, gt), [0.2, 2.8, 5.0])
+
+
+def test_along_view_is_positive_when_the_foot_is_closer_to_the_camera() -> None:
+    """Camera at the origin, truth straight ahead. A foot in between is positive."""
+    camera = np.array([0.0, 0.0])
+    truth = np.array([[0.0, 10.0], [0.0, 10.0]])
+    pred = np.array([[0.0, 8.0], [1.0, 10.0]])
+    along, sideways = ground_error_components(pred, truth, camera)
+    assert along[0] == pytest.approx(2.0)
+    assert sideways[0] == pytest.approx(0.0)
+    assert along[1] == pytest.approx(0.0)
+    assert sideways[1] == pytest.approx(-1.0)
+
+
+def test_recall_by_camera_distance_uses_three_bins() -> None:
+    gt = pd.DataFrame(
+        {
+            "frame_idx": [0, 0, 0],
+            "person_id": [1, 2, 3],
+            "X_m": [0.0, 0.0, 0.0],
+            "Y_m": [5.0, 15.0, 25.0],
+        }
+    )
+    matches = pd.DataFrame({"frame_idx": [0], "person_id": [1], "track_id": [7]})
+    rows = recall_by_camera_distance(gt, matches, np.array([0.0, 0.0]))
+    assert [row["bin"] for row in rows] == ["0-10", "10-20", ">20"]
+    assert [row["recall"] for row in rows] == [1.0, 0.0, 0.0]
+    assert [row["gt"] for row in rows] == [1, 1, 1]
+
+
+def _box_row(frame: int, xmin: float, ymin: float, xmax: float, ymax: float, **extra: float) -> dict[str, float]:
+    row = {"frame_idx": frame, "xmin": xmin, "ymin": ymin, "xmax": xmax, "ymax": ymax}
+    row.update(extra)
+    return row
+
+
+def test_distant_foot_categories_follow_the_priority_order() -> None:
+    """cut_off wins over a good overlap, and a wide box is partial rather than foot_wrong."""
+    tracks = pd.DataFrame(
+        [
+            _box_row(0, 100, 100, 160, 1076),  # overlaps the person and touches the bottom
+            _box_row(0, 80, 140, 200, 220),  # wide overlap: partial wins over foot_wrong
+            _box_row(0, 100, 100, 150, 250),  # tall overlap, foot is still far
+            _box_row(0, 800, 100, 850, 260),  # no overlap
+            _box_row(0, 140, 100, 200, 260),  # IoU 0.2 lands in other
+            _box_row(0, 100, 100, 150, 250),  # close foot, not classified
+        ]
+    )
+    gt = pd.DataFrame([_box_row(0, 100, 100, 160, 260)])
+    nearest = np.array([2.0, 2.0, 2.0, 2.0, 2.0, 0.2])
+    labels = classify_distant_feet(tracks, gt, nearest, far_m=1.0)
+    assert labels.tolist() == ["cut_off", "partial", "foot_wrong", "no_person", "other", ""]
+
+
+def test_left_edge_box_is_cut_off() -> None:
+    tracks = pd.DataFrame([_box_row(0, 0, 100, 40, 220)])
+    gt = pd.DataFrame([_box_row(0, 500, 100, 540, 240)])
+    assert classify_distant_feet(tracks, gt, np.array([3.0])).tolist() == ["cut_off"]
+
+
+def test_missed_people_split_by_box_overlap() -> None:
+    pred = pd.DataFrame([_box_row(0, 100, 100, 150, 250), _box_row(0, 400, 100, 440, 240)])
+    gt = pd.DataFrame(
+        [
+            _box_row(0, 100, 100, 150, 250, person_id=1, X_m=1.0, Y_m=1.0),
+            _box_row(0, 700, 100, 750, 260, person_id=2, X_m=8.0, Y_m=8.0),
+            _box_row(0, 400, 100, 440, 240, person_id=3, X_m=4.0, Y_m=4.0),
+        ]
+    )
+    matches = pd.DataFrame({"frame_idx": [0], "person_id": [3], "track_id": [1]})
+    missed = classify_missed_people(pred, gt, matches)
+    reasons = dict(zip(missed["person_id"], missed["reason"]))
+    assert reasons == {1: "detected_foot_wrong", 2: "not_detected"}
+    assert 3 not in reasons
+
+
+def test_unmatched_tracks_get_different_negative_ids() -> None:
+    tracks = _tracks([4, 4], [6, 6])
+    matches = pd.DataFrame(columns=["frame_idx", "track_id", "person_id"])
+    mapping = track_to_person_map(matches, tracks)
+    ids = dict(zip(mapping["track_id"], mapping["person_id"]))
+    assert ids == {4: -4, 6: -6}
+
+
+def test_relabel_tracks_keeps_one_row_per_person_per_frame() -> None:
+    tracks = _tracks([1, 1], [2, 2])
+    tracks.loc[tracks["track_id"] == 1, "score"] = 0.95
+    tracks.loc[tracks["track_id"] == 2, "score"] = 0.40
+    idmap = pd.DataFrame({"track_id": [1, 2], "person_id": [7, 7]})
+    relabeled, dropped = relabel_tracks(tracks, idmap)
+    assert dropped == 2
+    assert relabeled.groupby(["frame_idx", "person_id"]).size().max() == 1
+    assert relabeled["track_id"].tolist() == [1, 1]
+    assert relabeled["person_id"].tolist() == [7, 7]
 
 
 def test_validate_tracks_rejects_bad_tables() -> None:

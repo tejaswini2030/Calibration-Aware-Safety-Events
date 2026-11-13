@@ -8,7 +8,14 @@ import numpy as np
 import pandas as pd
 
 from src.data import project_root
-from src.evaluation import covered_interval, match_events, score_events
+from src.evaluation import (
+    covered_interval,
+    match_events,
+    match_events_anonymous,
+    mean_pair_midpoint,
+    score_events,
+    score_events_anonymous,
+)
 from src.events import load_event_config
 
 _EVENT_CONFIG = load_event_config(project_root() / "configs" / "events.yaml")
@@ -151,3 +158,80 @@ def test_no_events_reports_nan_f1() -> None:
     assert matches.empty
     assert scores["f1"].isna().all()
     assert not scores["f1"].isin([0.0, 1.0]).any()
+
+
+def test_anonymous_zone_matches_across_person_ids() -> None:
+    """Anonymous zone matching ignores person_id and pairs by zone + temporal IoU."""
+    gt = _frame([_event("zone", person_id=1, start_time=0.0, end_time=2.0)])
+    pred = _frame([_event("zone", person_id=99, start_time=0.0, end_time=2.0)])
+    scores_id, matches_id = score_events(gt, pred, _EVENT_CONFIG)
+    assert _total(scores_id, "zone")["tp"] == 0
+    assert matches_id.empty
+
+    scores, matches = score_events_anonymous(gt, pred, _EVENT_CONFIG)
+    row = _total(scores, "zone")
+    assert row["tp"] == 1
+    assert row["fp"] == 0
+    assert row["fn"] == 0
+    assert row["f1"] == 1.0
+    assert len(matches) == 1
+
+
+def test_anonymous_zone_greedy_highest_iou() -> None:
+    """When two preds overlap one GT zone event, the higher-IoU pred wins."""
+    gt = _frame([_event("zone", person_id=1, start_time=0.0, end_time=2.0)])
+    pred = _frame(
+        [
+            _event("zone", person_id=2, start_time=1.5, end_time=2.0),
+            _event("zone", person_id=3, start_time=0.0, end_time=2.0),
+        ]
+    )
+    pairs, unmatched_gt, unmatched_pred = match_events_anonymous(
+        gt, pred, "zone", frame_dt=FRAME_DT
+    )
+    assert len(pairs) == 1
+    assert pairs[0]["pred_index"] == 1
+    assert unmatched_gt.empty
+    assert len(unmatched_pred) == 1
+
+
+def test_anonymous_proximity_requires_nearby_midpoints() -> None:
+    """Proximity anonymous match needs overlapping time and midpoints within 1 m."""
+    times = np.array([0.0, FRAME_DT, 2 * FRAME_DT], dtype=float)
+    gt_tracks = pd.DataFrame(
+        {
+            "time_sec": np.tile(times, 2),
+            "person_id": np.repeat([1, 2], len(times)),
+            "X_m": np.concatenate([np.zeros(len(times)), np.full(len(times), 0.5)]),
+            "Y_m": np.zeros(2 * len(times)),
+        }
+    )
+    # Predicted pair shifted by 0.4 m (OK) vs 2.0 m (too far).
+    pred_near = gt_tracks.copy()
+    pred_near["person_id"] = pred_near["person_id"].map({1: 10, 2: 20})
+    pred_near["X_m"] = pred_near["X_m"] + 0.4
+    pred_far = pred_near.copy()
+    pred_far["X_m"] = pred_far["X_m"] + 1.6
+
+    gt = _frame([_event("proximity", start_time=0.0, end_time=2 * FRAME_DT)])
+    pred = _frame(
+        [
+            _event("proximity", person_a=10, person_b=20, start_time=0.0, end_time=2 * FRAME_DT),
+        ]
+    )
+    mid_gt = mean_pair_midpoint(gt_tracks, 1, 2, 0.0, 3 * FRAME_DT)
+    mid_near = mean_pair_midpoint(pred_near, 10, 20, 0.0, 3 * FRAME_DT)
+    assert mid_gt is not None and mid_near is not None
+    assert float(np.linalg.norm(mid_gt - mid_near)) <= 1.0
+
+    scores_near, matches_near = score_events_anonymous(
+        gt, pred, _EVENT_CONFIG, gt_tracks=gt_tracks, pred_tracks=pred_near
+    )
+    assert _total(scores_near, "proximity")["tp"] == 1
+    assert len(matches_near) == 1
+
+    scores_far, matches_far = score_events_anonymous(
+        gt, pred, _EVENT_CONFIG, gt_tracks=gt_tracks, pred_tracks=pred_far
+    )
+    assert _total(scores_far, "proximity")["tp"] == 0
+    assert matches_far.empty

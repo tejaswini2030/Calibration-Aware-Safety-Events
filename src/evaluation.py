@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Callable
 
+import numpy as np
 import pandas as pd
 
 EVENT_TYPES = ("zone", "dwell", "proximity")
@@ -292,6 +293,207 @@ def score_events(
             event_type,
             frame_dt,
             min_iou=min_iou,
+        )
+        all_pairs.extend(pairs)
+        tp, fp, fn = _counts_for_zone(pairs, unmatched_gt, unmatched_pred, "all")
+        rows.append(_score_row(event_type, "all", tp, fp, fn))
+        if event_type == "proximity":
+            continue
+        gt_type = _events_of_type(gt_df, event_type)
+        pred_type = _events_of_type(pred_df, event_type)
+        for zone_id in _zone_ids(cfg, gt_type, pred_type):
+            tp, fp, fn = _counts_for_zone(pairs, unmatched_gt, unmatched_pred, zone_id)
+            rows.append(_score_row(event_type, zone_id, tp, fp, fn))
+
+    scores = pd.DataFrame(rows, columns=SCORE_COLUMNS)
+    if not all_pairs:
+        return scores, _empty_matches()
+    matches = pd.DataFrame(all_pairs)
+    matches = matches.sort_values(
+        ["event_type", "gt_start", "pred_start"],
+        kind="mergesort",
+    ).reset_index(drop=True)
+    return scores, matches[MATCH_COLUMNS]
+
+
+def overlap_interval(
+    gt_start: float,
+    gt_end: float,
+    pred_start: float,
+    pred_end: float,
+    frame_dt: float,
+) -> tuple[float, float] | None:
+    """Return the half-open overlap of two frame-inclusive events, or None."""
+    gt_lo, gt_hi = covered_interval(gt_start, gt_end, frame_dt)
+    pred_lo, pred_hi = covered_interval(pred_start, pred_end, frame_dt)
+    lo = max(gt_lo, pred_lo)
+    hi = min(gt_hi, pred_hi)
+    if hi <= lo:
+        return None
+    return float(lo), float(hi)
+
+
+def mean_pair_midpoint(
+    tracks: pd.DataFrame,
+    person_a: Any,
+    person_b: Any,
+    start_time: float,
+    end_time: float,
+) -> np.ndarray | None:
+    """Mean midpoint of two people over frames in [start_time, end_time).
+
+    Only frames where both people appear are used. Returns None when there is
+    no shared frame in that window.
+    """
+    if tracks.empty:
+        return None
+    a_id = _key_value(person_a)
+    b_id = _key_value(person_b)
+    window = tracks.loc[(tracks["time_sec"] >= start_time) & (tracks["time_sec"] < end_time)]
+    if window.empty:
+        return None
+    left = window.loc[window["person_id"].map(_key_value) == a_id, ["time_sec", "X_m", "Y_m"]]
+    right = window.loc[window["person_id"].map(_key_value) == b_id, ["time_sec", "X_m", "Y_m"]]
+    if left.empty or right.empty:
+        return None
+    merged = left.merge(right, on="time_sec", suffixes=("_a", "_b"))
+    if merged.empty:
+        return None
+    mid_x = 0.5 * (merged["X_m_a"].to_numpy(dtype=float) + merged["X_m_b"].to_numpy(dtype=float))
+    mid_y = 0.5 * (merged["Y_m_a"].to_numpy(dtype=float) + merged["Y_m_b"].to_numpy(dtype=float))
+    return np.array([float(mid_x.mean()), float(mid_y.mean())], dtype=np.float64)
+
+
+def match_events_anonymous(
+    gt_df: pd.DataFrame,
+    pred_df: pd.DataFrame,
+    event_type: str,
+    frame_dt: float,
+    min_iou: float = 0.0,
+    compatible: Callable[[pd.Series, pd.Series, float, float], bool] | None = None,
+) -> tuple[list[dict[str, Any]], pd.DataFrame, pd.DataFrame]:
+    """Match events without requiring person identities.
+
+    Zone and dwell must share zone_id. Proximity (and any other type) accepts
+    every temporally overlapping pair unless `compatible` returns False.
+    `compatible(gt_row, pred_row, overlap_lo, overlap_hi)` may enforce a
+    location check. Matching is one-to-one and greedy by highest temporal IoU.
+    """
+    gt = _events_of_type(gt_df, event_type)
+    pred = _events_of_type(pred_df, event_type)
+    required = ("start_time", "end_time")
+    if event_type in ("zone", "dwell"):
+        required = ("start_time", "end_time", "zone_id")
+    _require_columns(gt, required, event_type)
+    _require_columns(pred, required, event_type)
+    if gt.empty or pred.empty:
+        return [], gt, pred
+
+    gt_labels = list(gt.index)
+    pred_labels = list(pred.index)
+    gt_starts = gt["start_time"].to_numpy(dtype=float)
+    gt_ends = gt["end_time"].to_numpy(dtype=float)
+    pred_starts = pred["start_time"].to_numpy(dtype=float)
+    pred_ends = pred["end_time"].to_numpy(dtype=float)
+
+    candidates: list[tuple[float, int, int]] = []
+    for gt_pos in range(len(gt)):
+        for pred_pos in range(len(pred)):
+            if event_type in ("zone", "dwell"):
+                if _key_value(gt.iloc[gt_pos]["zone_id"]) != _key_value(pred.iloc[pred_pos]["zone_id"]):
+                    continue
+            iou = temporal_iou(
+                gt_starts[gt_pos],
+                gt_ends[gt_pos],
+                pred_starts[pred_pos],
+                pred_ends[pred_pos],
+                frame_dt,
+            )
+            if iou <= min_iou:
+                continue
+            overlap = overlap_interval(
+                gt_starts[gt_pos],
+                gt_ends[gt_pos],
+                pred_starts[pred_pos],
+                pred_ends[pred_pos],
+                frame_dt,
+            )
+            if overlap is None:
+                continue
+            if compatible is not None and not compatible(gt.iloc[gt_pos], pred.iloc[pred_pos], overlap[0], overlap[1]):
+                continue
+            candidates.append((iou, gt_pos, pred_pos))
+    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+
+    matched_gt: set[int] = set()
+    matched_pred: set[int] = set()
+    pairs: list[dict[str, Any]] = []
+    for iou, gt_pos, pred_pos in candidates:
+        if gt_pos in matched_gt or pred_pos in matched_pred:
+            continue
+        matched_gt.add(gt_pos)
+        matched_pred.add(pred_pos)
+        gt_row = gt.iloc[gt_pos]
+        pairs.append(
+            {
+                "event_type": event_type,
+                "zone_id": gt_row["zone_id"] if "zone_id" in gt.columns else None,
+                "person_id": None,
+                "person_a": None,
+                "person_b": None,
+                "gt_index": gt_labels[gt_pos],
+                "pred_index": pred_labels[pred_pos],
+                "gt_start": float(gt_starts[gt_pos]),
+                "gt_end": float(gt_ends[gt_pos]),
+                "pred_start": float(pred_starts[pred_pos]),
+                "pred_end": float(pred_ends[pred_pos]),
+                "start_delay": float(pred_starts[pred_pos] - gt_starts[gt_pos]),
+                "temporal_iou": float(iou),
+            }
+        )
+
+    unmatched_gt = gt.iloc[[pos for pos in range(len(gt)) if pos not in matched_gt]]
+    unmatched_pred = pred.iloc[[pos for pos in range(len(pred)) if pos not in matched_pred]]
+    return pairs, unmatched_gt, unmatched_pred
+
+
+def score_events_anonymous(
+    gt_df: pd.DataFrame,
+    pred_df: pd.DataFrame,
+    cfg: dict[str, Any],
+    gt_tracks: pd.DataFrame | None = None,
+    pred_tracks: pd.DataFrame | None = None,
+    min_iou: float = 0.0,
+    max_midpoint_dist_m: float = 1.0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Identity-free event scores.
+
+    Zone and dwell match on zone_id and temporal overlap. Proximity matches on
+    temporal overlap when the mean pair midpoints during the overlap are within
+    max_midpoint_dist_m. Requires gt_tracks and pred_tracks for proximity.
+    """
+    frame_dt = frame_dt_from_config(cfg)
+
+    def proximity_compatible(gt_row: pd.Series, pred_row: pd.Series, lo: float, hi: float) -> bool:
+        if gt_tracks is None or pred_tracks is None:
+            raise ValueError("Anonymous proximity scoring needs gt_tracks and pred_tracks")
+        gt_mid = mean_pair_midpoint(gt_tracks, gt_row["person_a"], gt_row["person_b"], lo, hi)
+        pred_mid = mean_pair_midpoint(pred_tracks, pred_row["person_a"], pred_row["person_b"], lo, hi)
+        if gt_mid is None or pred_mid is None:
+            return False
+        return float(np.linalg.norm(gt_mid - pred_mid)) <= max_midpoint_dist_m
+
+    rows: list[dict[str, Any]] = []
+    all_pairs: list[dict[str, Any]] = []
+    for event_type in EVENT_TYPES:
+        compatible = proximity_compatible if event_type == "proximity" else None
+        pairs, unmatched_gt, unmatched_pred = match_events_anonymous(
+            gt_df,
+            pred_df,
+            event_type,
+            frame_dt,
+            min_iou=min_iou,
+            compatible=compatible,
         )
         all_pairs.extend(pairs)
         tp, fp, fn = _counts_for_zone(pairs, unmatched_gt, unmatched_pred, "all")
