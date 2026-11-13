@@ -190,6 +190,8 @@ Plotted against ground position error instead of pixels, the curves for both cam
 
 An installation can be checked against these limits by measuring the reprojection error of a few surveyed floor points. The limits depend on our event settings (1.5 m proximity threshold, 0.1 m hysteresis, 3 m zones, 2 s dwell) and on pedestrian motion in this scene.
 
+![F1 vs ground position error, C1 and C6](docs/figures/f1_vs_position_error_C1_C6.png)
+
 ---
 
 ## Dataset
