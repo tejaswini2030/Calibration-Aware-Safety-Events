@@ -24,6 +24,8 @@ EPS_ALL = (0.0, 1.0, 2.0, 3.0, 5.0, 10.0)
 ANGLES = (0.0, 0.05, 0.1, 0.25, 0.5, 1.0)
 CAM_COLORS = {"C1": "#e07a2f", "C6": "#3d6fd8"}
 LAYOUT_LINESTYLES = {"n4": "-", "n12": "--"}
+LAYOUT_MARKERS = {"n4": "o", "n12": "s"}
+F1_THRESHOLD = 0.95
 
 
 def _mean_at(frame: pd.DataFrame, mask: pd.Series, column: str) -> float:
@@ -37,9 +39,116 @@ def _tolerance(frame: pd.DataFrame, layout: str, event_type: str) -> float:
     for eps in EPS_ALL:
         mask = (frame["layout"] == layout) & np.isclose(frame["eps_px"], eps)
         mean_f1 = _mean_at(frame, mask, f"f1_{event_type}")
-        if mean_f1 >= 0.95 - 1e-12:
+        if mean_f1 >= F1_THRESHOLD - 1e-12:
             best = float(eps)
     return best
+
+
+def _layout_means(frame: pd.DataFrame, layout: str) -> pd.DataFrame:
+    """Mean F1 and position error at each tested eps for one layout."""
+    rows: list[dict] = []
+    for eps in EPS_ALL:
+        mask = (frame["layout"] == layout) & np.isclose(frame["eps_px"], eps)
+        if not mask.any():
+            continue
+        row: dict = {
+            "eps_px": float(eps),
+            "pos_mean_m": _mean_at(frame, mask, "pos_mean_m"),
+        }
+        for event_type in EVENT_TYPES:
+            row[f"f1_{event_type}"] = _mean_at(frame, mask, f"f1_{event_type}")
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _largest_pos_at_f1(
+    positions: np.ndarray | list[float],
+    f1_values: np.ndarray | list[float],
+    threshold: float = F1_THRESHOLD,
+) -> float:
+    """Largest mean position error with F1 >= threshold (linear interp at crossing)."""
+    pos = np.asarray(positions, dtype=float)
+    f1 = np.asarray(f1_values, dtype=float)
+    order = np.argsort(pos)
+    pos = pos[order]
+    f1 = f1[order]
+    if not np.any(f1 >= threshold):
+        return float("nan")
+    if np.all(f1 >= threshold):
+        return float(pos[-1])
+    best = float(pos[f1 >= threshold].max())
+    for i in range(len(pos) - 1):
+        f0, f1_next = float(f1[i]), float(f1[i + 1])
+        p0, p1 = float(pos[i]), float(pos[i + 1])
+        if f0 >= threshold and f1_next < threshold:
+            t = (threshold - f0) / (f1_next - f0)
+            best = float(p0 + t * (p1 - p0))
+    return best
+
+
+def build_tolerance_meters(c1: pd.DataFrame, c6: pd.DataFrame) -> pd.DataFrame:
+    """Largest mean position error with mean F1 >= 0.95, pooling n4 and n12 per camera."""
+    curves = {
+        (cam, layout): _layout_means(frame, layout)
+        for cam, frame in (("C1", c1), ("C6", c6))
+        for layout in LAYOUTS
+    }
+    rows: list[dict] = []
+    for event_type in EVENT_TYPES:
+        row: dict = {"event_type": event_type}
+        for cam in ("C1", "C6"):
+            pos_list: list[float] = []
+            f1_list: list[float] = []
+            for layout in LAYOUTS:
+                curve = curves[(cam, layout)]
+                pos_list.extend(curve["pos_mean_m"].tolist())
+                f1_list.extend(curve[f"f1_{event_type}"].tolist())
+            row[f"{cam}_pos_m_f1_ge_0.95"] = _largest_pos_at_f1(pos_list, f1_list)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def plot_f1_vs_position_error(c1: pd.DataFrame, c6: pd.DataFrame, path: Path) -> None:
+    """Mean event F1 against mean position error for both cameras and layouts."""
+    fig, axes = plt.subplots(1, 3, figsize=(12.5, 4.2), sharey=True)
+    for ax, event_type in zip(axes, EVENT_TYPES):
+        for cam, frame in (("C1", c1), ("C6", c6)):
+            for layout in LAYOUTS:
+                curve = _layout_means(frame, layout).sort_values("pos_mean_m")
+                ax.plot(
+                    curve["pos_mean_m"],
+                    curve[f"f1_{event_type}"],
+                    color=CAM_COLORS[cam],
+                    linestyle=LAYOUT_LINESTYLES[layout],
+                    marker=LAYOUT_MARKERS[layout],
+                    linewidth=1.8,
+                    label=f"{cam} {layout}",
+                )
+        ax.axhline(F1_THRESHOLD, color="0.5", linestyle=":", linewidth=1.0)
+        ax.set_title(event_type)
+        ax.set_xlabel("mean position error (m)")
+        ax.set_ylabel("F1")
+        ax.set_ylim(0.0, 1.05)
+        ax.set_xlim(left=0.0)
+        ax.grid(True, alpha=0.3)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=4, frameon=False, bbox_to_anchor=(0.5, 1.08))
+    fig.suptitle("Event F1 vs mean position error (C1 vs C6)", y=1.14)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {path.name}")
+
+
+def _print_tolerance_meters(table: pd.DataFrame) -> None:
+    print("\nLargest mean position error with mean F1 >= 0.95 (linear interp, n4+n12 pooled)")
+    print(f"{'event':>10}  {'C1':>8}  {'C6':>8}")
+    for _, row in table.iterrows():
+        print(
+            f"{row['event_type']:>10}  "
+            f"{row['C1_pos_m_f1_ge_0.95']:8.4f}  "
+            f"{row['C6_pos_m_f1_ge_0.95']:8.4f}"
+        )
 
 
 def build_compare_table(c1: pd.DataFrame, c6: pd.DataFrame) -> pd.DataFrame:
@@ -183,8 +292,16 @@ def main() -> None:
     table.to_csv(path, index=False, float_format="%.6f")
     print(f"Saved {path.name} ({len(table)} rows)")
     _print_compare(table, c1_n, c6_n)
+
+    meters = build_tolerance_meters(c1_n, c6_n)
+    meters_path = out / "tolerance_meters_C1_C6.csv"
+    meters.to_csv(meters_path, index=False, float_format="%.6f")
+    print(f"Saved {meters_path.name} ({len(meters)} rows)")
+    _print_tolerance_meters(meters)
+
     plot_f1_vs_eps(c1_n, c6_n, out / "f1_vs_eps_C1_vs_C6.png")
     plot_f1_vs_bump(c1_b, c6_b, out / "f1_vs_bump_C1_vs_C6.png")
+    plot_f1_vs_position_error(c1_n, c6_n, out / "f1_vs_position_error_C1_C6.png")
 
 
 if __name__ == "__main__":

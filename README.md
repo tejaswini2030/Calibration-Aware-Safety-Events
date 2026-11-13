@@ -11,7 +11,7 @@ Dhanya Kini Bailoor and Tejaswini Sarikonda.
 
 ## Status
 
-The full pipeline is built and verified on WILDTRACK camera **C1**:
+The full pipeline is built and verified on WILDTRACK camera **C1**, and the calibration study is repeated on camera **C6**:
 
 ```
 video → detection → tracking → foot point → homography → event logic → scoring
@@ -24,6 +24,10 @@ Completed experiments:
 3. A perception error budget: foot points, detector vs tracker, and boundary effects.
 4. Event F1 on predicted tracks under perfect calibration.
 5. Calibration sweep on predicted tracks (5 models × 5 noise levels × 100 trials).
+6. Mitigations: more calibration points (4, 6, 8, 12) and RANSAC against a badly clicked point.
+7. Calibration layouts: where the points are placed.
+8. Camera bump: small rotations after calibration (pitch, yaw, roll).
+9. A second camera (C6), and a camera-independent guideline in meters.
 
 ## Main findings
 
@@ -33,6 +37,10 @@ Completed experiments:
 4. **Proximity is the most robust event and dwell the most fragile,** with perfect tracks and with real ones. Homography error is spatially smooth, so two nearby people are shifted almost identically. Dwell stacks a space and a time threshold, and most visits last only 2–3 s.
 5. **Distance from the camera dominates position error,** more than extrapolating outside the calibration rectangle (at 10 px: 0.22 m near, 0.63 m far).
 6. **More calibration points are a cheap fix.** Going from 4 to 12 points halves position error and makes zone alarms tolerate twice the clicking error; dwell goes from 1 px to 3 px.
+7. **RANSAC removes a badly clicked point,** but only with redundancy. One point 50 px off among 12 drops dwell F1 to 0.80 with least squares; RANSAC restores it to 0.98 and catches the outlier in all trials from 20 px.
+8. **Where you click matters as much as how many points.** With 4 points at 5 px, position error ranges from 0.21 m (points spread across the plaza) to 0.80 m (points only at the far end).
+9. **A camera bump hurts more than random clicking errors.** A 0.25° tilt (about 7.6 px) drops dwell F1 to 0.56, worse than 10 px of random noise, because every point moves the same way. Pitch is far more damaging than yaw or roll.
+10. **The findings generalize across cameras when error is measured in meters.** C6's pixel tolerances are tighter, but F1 against ground position error nearly coincides for both cameras: keep ground error below about 0.4 m for proximity, 0.25 m for zone, and 0.06 m for dwell.
 
 ## Results
 
@@ -124,6 +132,64 @@ Adding calibration correspondences is a cheap and effective mitigation. Moving f
 
 Tested noise levels: 0, 1, 2, 3, 5 and 10 px, 100 trials each. Layouts n4, n6, n8 and n12 all lie inside the same rectangle (`scripts/run_sweep_npoints.py`).
 
+### 6. Mitigation: RANSAC against a badly clicked point
+
+Every one of 12 points gets 1 px of click noise, and one random point additionally gets an outlier error of 0–50 px (100 trials each). Our RANSAC evaluates all 495 minimal subsets with a 3 px transfer-error threshold, then refits on the inliers; OpenCV's RANSAC is the reference.
+
+| Estimator (outlier 50 px) | Zone F1 | Dwell F1 | Proximity F1 | Position error | Outlier detected |
+|---|---:|---:|---:|---:|---:|
+| Least-squares DLT | 0.955 | 0.802 | 0.965 | 0.280 m | — |
+| Our RANSAC | 0.994 | 0.982 | 0.998 | 0.024 m | 100% |
+| OpenCV RANSAC | 0.992 | 0.974 | 0.996 | 0.035 m | 100% |
+
+Our RANSAC detects the outlier in at least 96% of trials from 10 px and in all trials from 20 px. With only 4 points the fit is exact, so an outlier cannot be detected; extra points help twice, by averaging noise and by making bad clicks detectable. OpenCV's threshold is in meters here (3 px × 0.0523 m/px = 0.157 m), which may explain its slightly weaker result.
+
+### 7. Calibration layouts
+
+| Layout (4 points, 5 px) | Zone F1 | Dwell F1 | Proximity F1 | Position error |
+|---|---:|---:|---:|---:|
+| Wide (whole plaza) | 0.961 | 0.826 | 0.979 | 0.214 m |
+| Near only | 0.952 | 0.732 | 0.969 | 0.312 m |
+| Narrow (small, central) | 0.921 | 0.709 | 0.932 | 0.433 m |
+| Far only | 0.872 | 0.638 | 0.927 | 0.798 m |
+
+Widely spread points act as a long lever, so click noise tilts the fit less. Far-only points extrapolate badly toward the camera (Near-zone error about 1.8 m at 5 px). Twelve points help every layout (wide dwell 0.826 → 0.922) but do not make up for poor coverage.
+
+### 8. Camera bump after calibration
+
+The camera is rotated by a small angle after calibration, and the system keeps using the original *H\**. At the image centre, 0.1° ≈ 3.0 px, 0.25° ≈ 7.6 px and 1° ≈ 30.4 px.
+
+| Axis | F1 at 0.25° (zone / dwell / prox) | Position error at 0.25° | F1 at 1° (zone / dwell / prox) | Position error at 1° |
+|---|---|---:|---|---:|
+| Pitch | 0.92 / 0.56 / 0.97 | 0.55 m | 0.45 / 0.17 / 0.85 | 2.27 m |
+| Yaw | 0.98 / 0.91 / 1.00 | 0.09 m | 0.90 / 0.66 / 0.99 | 0.38 m |
+| Roll | 0.97 / 0.86 / 0.99 | 0.14 m | 0.90 / 0.43 / 0.95 | 0.57 m |
+
+Pitch is by far the most harmful: far ground points lie near the horizon, where small tilts move their back-projection greatly (at 1°: Near 0.29 m, Far 4.34 m). A bump moves every point the same way, so it hurts more than random noise of the same size.
+
+### 9. Second camera (C6) and a guideline in meters
+
+C6 zones lie at 8.0, 24.7 and 32.5 m from the camera (C1: 6.6, 18.0, 26.3 m). Its answer key has 219 zone, 119 dwell and 371 proximity events.
+
+| Layout | ε | C1 F1 (zone / dwell / prox) | C6 F1 (zone / dwell / prox) | C1 position error | C6 position error |
+|---|---:|---|---|---:|---:|
+| 4 points | 5 px | 0.96 / 0.83 / 0.98 | 0.93 / 0.73 / 0.97 | 0.21 m | 0.33 m |
+| 4 points | 10 px | 0.93 / 0.65 / 0.96 | 0.85 / 0.54 / 0.93 | 0.43 m | 0.67 m |
+| 12 points | 5 px | 0.98 / 0.92 / 0.99 | 0.97 / 0.84 / 0.98 | 0.11 m | 0.19 m |
+| 12 points | 10 px | 0.96 / 0.84 / 0.97 | 0.92 / 0.69 / 0.96 | 0.22 m | 0.39 m |
+
+The ranking holds on both cameras. C6 is stricter in pixels because its zones are farther away, where each pixel spans more ground, and a pitch bump hurts it more (zone F1 at 0.5°: C6 0.32, C1 0.84).
+
+Plotted against ground position error instead of pixels, the curves for both cameras and both layouts nearly coincide (`scripts/compare_C1_C6.py`). This gives a **camera-independent guideline**:
+
+| Event | Largest mean position error with mean F1 ≥ 0.95 (C1 / C6) | Guideline |
+|---|---|---:|
+| Proximity | 0.431 m / 0.439 m | ≤ 0.4 m |
+| Zone | 0.299 m / 0.260 m | ≤ 0.25 m |
+| Dwell | 0.072 m / 0.061 m | ≤ 0.06 m |
+
+An installation can be checked against these limits by measuring the reprojection error of a few surveyed floor points. The limits depend on our event settings (1.5 m proximity threshold, 0.1 m hysteresis, 3 m zones, 2 s dwell) and on pedestrian motion in this scene.
+
 ---
 
 ## Dataset
@@ -173,10 +239,11 @@ Requires Python 3 with numpy, opencv-python, pandas, matplotlib, pyyaml, scipy, 
 ## Repository layout
 
 ```
-configs/events.yaml   zones, thresholds, hysteresis, debounce, dwell time
+configs/events.yaml     C1 zones, thresholds, hysteresis, debounce, dwell time
+configs/events_C6.yaml  C6 zones (same thresholds)
 src/
   data.py             annotation loading, position ID → meters
-  geometry.py         calibration, H* = K [r1 r2 t], projection, normalized DLT
+  geometry.py         calibration, H* = K [r1 r2 t], projection, normalized DLT, RANSAC
   events.py           shared hysteresis function; zone, dwell, proximity detection
   evaluation.py       event matching and precision / recall / F1
   perturb.py          calibration points, pixel perturbation, single trial
@@ -212,6 +279,9 @@ python scripts/check_zero_noise.py
 # 4. Calibration sweep on ground-truth tracks (5 noise levels × 200 trials)
 python scripts/run_sweep.py               # → outputs/sweep_C1_gt_tracks.csv and plots
 python scripts/run_sweep_npoints.py       # → outputs/sweep_C1_npoints.csv, tolerance_npoints_C1.csv and plots
+python scripts/run_sweep_outlier.py       # → outputs/sweep_C1_outlier.csv (DLT vs RANSAC)
+python scripts/run_sweep_layouts.py       # → outputs/sweep_C1_layouts.csv (wide, narrow, near-only, far-only)
+python scripts/run_sweep_bump.py          # → outputs/sweep_C1_bump.csv (pitch, yaw, roll)
 
 # 5. Detection and tracking
 python scripts/run_detection.py --device mps   # → results/detections/det_C1_{yolo11n,yolo11x}.csv
@@ -224,7 +294,19 @@ python scripts/diagnose_foot_points.py         # perception error budget → out
 python scripts/run_events_on_tracks.py    # → outputs/events_on_tracks_C1.csv
 python scripts/run_sweep_tracks.py        # → outputs/sweep_C1_pred_tracks.csv and plots (checks eps = 0 against step 6)
 
-# Tests (73)
+# 7. Second camera (ground-truth tracks): pass --cam C6
+python scripts/show_zones.py --cam C6
+python scripts/make_gt_events.py --cam C6
+python scripts/run_sweep_npoints.py --cam C6
+python scripts/run_sweep_bump.py --cam C6
+python scripts/save_calib_points_C6.py    # → outputs/calib_points_C6.png (wide 4-point layout and 12-point grid)
+python scripts/compare_C1_C6.py           # → outputs/compare_C1_C6.csv, f1_vs_eps_C1_vs_C6.png, f1_vs_bump_C1_vs_C6.png,
+                                          #   f1_vs_position_error_C1_C6.png, tolerance_meters_C1_C6.csv
+
+# 8. All report figures and tables from the saved CSVs → outputs/report/
+python scripts/make_report_figures.py
+
+# Tests (76)
 python -m pytest
 ```
 
@@ -287,6 +369,8 @@ Dwell fires when a zone visit lasts at least `dwell_seconds`; the alarm starts a
 | Full pipeline, 0 px | F1 = 1.0 on all seeds; largest foot shift 2.5e-14 m |
 | True positions through the track path | F1 = 1.0 |
 | Predicted-track sweep at 0 px | Matches `events_on_tracks_C1.csv` exactly for all models and both scorings |
+| New sweeps (points, outlier, layouts, bump, C6) at zero noise | F1 = 1.0 for every layout, estimator and axis |
+| Own RANSAC | Finds a synthetic 30 px outlier; keeps all 12 points when there is none |
 
 ## Design choices to note
 
@@ -300,10 +384,10 @@ Dwell fires when a zone visit lasts at least `dwell_seconds`; the alarm starts a
 
 ## Limitations
 
-- Only camera C1 and one calibration layout.
+- Two cameras (C1, C6); perception experiments on C1 only.
 - Short clip (200 s), so the Near zone (33 zone, 17 dwell events) is noisier.
 - 2 fps limits timing resolution to 0.5 s and makes tracking harder than at video frame rates.
-- Equal noise at all four points; minimal 4-point case only.
+- Click noise has the same size at every point; the bump model covers rotations only, not translations.
 - Detectors are used off the shelf, without fine-tuning on WILDTRACK.
 
 ## Roadmap
@@ -314,11 +398,12 @@ Dwell fires when a zone visit lasts at least `dwell_seconds`; the alarm starts a
 - [x] Event F1 on predicted tracks (identity and anonymous scoring)
 - [x] Calibration sweep on predicted tracks
 - [ ] Threshold-distance analysis and dwell-failure breakdown
-- [ ] Add ε = 2 px for a finer guideline
+- [x] Add ε = 2 px for a finer guideline (more-points sweep)
 - [ ] Foot point: box bottom-center vs pose-model ankles
-- [ ] Camera bump (small rotations) and calibration-layout experiments
+- [x] Camera bump (small rotations) and calibration-layout experiments
 - [x] More than 4 points as a mitigation
-- [ ] 2–3 more cameras with different viewing angles
+- [x] RANSAC against a badly clicked point
+- [x] A second camera (C6) and a camera-independent guideline in meters
 
 ## References
 
