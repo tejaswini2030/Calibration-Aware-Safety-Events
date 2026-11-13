@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -15,8 +16,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.data import DATA_ROOT, load_annotations, project_root, resolve_dataset_root
-from src.events import load_event_config
+from src.data import DATA_ROOT, load_annotations, normalize_cam_id, project_root, resolve_dataset_root
+from src.events import event_config_path, load_event_config, signed_distance_to_polygon
 from src.geometry import ground_homography, load_camera_calibration, world_to_image
 
 # RGB colors shared by the bird's-eye plot. Image drawing converts to BGR.
@@ -192,11 +193,24 @@ def save_image_overlay(
         raise OSError(f"Could not write {path}")
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--cam",
+        default="C1",
+        help="Camera id (default C1 → configs/events.yaml)",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
     """Load the event config, print zone distances, and save both figures."""
-    config_path = project_root() / "configs" / "events.yaml"
+    args = _parse_args()
+    cam_id = normalize_cam_id(args.cam)
+    config_path = event_config_path(cam_id)
     config = load_event_config(config_path)
-    cam_id = str(config["camera"])
+    if str(config["camera"]) != cam_id:
+        raise ValueError(f"{config_path.name} camera is {config['camera']!r}, expected {cam_id!r}")
     dataset = resolve_dataset_root(DATA_ROOT)
     K, R, t = load_camera_calibration(dataset, cam_id)
     H = ground_homography(K, R, t)
@@ -204,6 +218,11 @@ def main() -> None:
     frame_path, image = first_frame_image(dataset, cam_id)
     height, width = image.shape[:2]
 
+    annotations = load_annotations(dataset, cam_id)
+    visible_rows = annotations.loc[annotations["visible"], ["person_id", "X_m", "Y_m"]]
+    visible = visible_rows[["X_m", "Y_m"]].to_numpy()
+
+    print(f"Config: {config_path.relative_to(project_root())}")
     print(f"Camera {cam_id} center: ({camera[0]:.3f}, {camera[1]:.3f}, {camera[2]:.3f}) m")
     print(f"Frame: {frame_path.name} ({width} x {height})")
     for zone in config["zones"]:
@@ -214,16 +233,16 @@ def main() -> None:
         uv = world_to_image(H, polygon)
         depth = (np.column_stack([polygon, np.zeros(len(polygon))]) @ R.T + t.ravel())[:, 2]
         inside = _corners_inside(uv, depth, width, height)
+        inside_mask = signed_distance_to_polygon(visible, polygon) >= 0.0
+        visitors = int(visible_rows.loc[inside_mask, "person_id"].nunique())
         print(
             f"{zone['id']}: ground distance {ground_m:.2f} m "
             f"({distance_m:.2f} m from the camera center to the zone center), "
-            f"all corners inside image: {inside}"
+            f"visitors={visitors}, all corners inside image: {inside}"
         )
         if not inside:
             print(f"  projected corners:\n{np.array2string(uv, precision=1)}")
 
-    annotations = load_annotations(dataset, cam_id)
-    visible = annotations.loc[annotations["visible"], ["X_m", "Y_m"]].to_numpy()
     output_dir = project_root() / "outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
     birdseye_path = output_dir / f"zones_birdseye_{cam_id}.png"

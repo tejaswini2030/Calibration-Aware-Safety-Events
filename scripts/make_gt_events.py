@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -14,11 +15,12 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.data import DATA_ROOT, load_annotations, project_root, resolve_dataset_root
+from src.data import DATA_ROOT, load_annotations, normalize_cam_id, project_root, resolve_dataset_root
 from src.events import (
     detect_dwell_events,
     detect_proximity_events,
     detect_zone_events,
+    event_config_path,
     load_event_config,
 )
 
@@ -155,10 +157,23 @@ def save_timeline(events: pd.DataFrame, path: Path, title: str) -> None:
     plt.close(fig)
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--cam",
+        default="C1",
+        help="Camera id (default C1 → configs/events.yaml)",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
-    """Detect C1 ground-truth events with and without hysteresis."""
-    cfg = load_event_config(project_root() / "configs" / "events.yaml")
-    cam_id = str(cfg["camera"])
+    """Detect ground-truth events with and without hysteresis."""
+    args = _parse_args()
+    cam_id = normalize_cam_id(args.cam)
+    cfg = load_event_config(event_config_path(cam_id))
+    if str(cfg["camera"]) != cam_id:
+        raise ValueError(f"Config camera is {cfg['camera']!r}, expected {cam_id!r}")
     frame_dt = 1.0 / float(cfg["fps"])
     tracks = visible_tracks(cam_id)
     print(f"Visible rows in {cam_id}: {len(tracks)}")

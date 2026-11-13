@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Sweep calibration noise vs number of calibration points on C1 GT tracks.
+"""Sweep calibration noise vs number of calibration points on GT tracks.
 
 Layouts n4 / n6 / n8 / n12 all sit inside the same wide ground rectangle.
 Each trial perturbs every calibration pixel by exactly eps px, re-estimates H
 with normalized DLT (least squares for N > 4), and reuses run_trial for
 projection, event detection, and scoring. Existing sweep CSV files are not
-modified.
+modified. Pass --cam C6 for the second-camera study (n4 and n12 only).
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import time
@@ -27,11 +28,12 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.data import DATA_ROOT, load_annotations, project_root, resolve_dataset_root
-from src.events import load_event_config
+from src.data import DATA_ROOT, load_annotations, normalize_cam_id, project_root, resolve_dataset_root
+from src.events import event_config_path, load_event_config
 from src.perturb import _first_frame, choose_calibration_points, run_trial
 
-LAYOUTS = ("n4", "n6", "n8", "n12")
+LAYOUTS_DEFAULT = ("n4", "n6", "n8", "n12")
+LAYOUTS_CORE = ("n4", "n12")
 EPS_PX = (0, 1, 2, 3, 5, 10)
 N_TRIALS = 100
 SEEDS = tuple(range(N_TRIALS))
@@ -56,6 +58,7 @@ _CAM_ID: str | None = None
 _TRACKS: pd.DataFrame | None = None
 _EVENTS: pd.DataFrame | None = None
 _CFG: dict | None = None
+_ACTIVE_LAYOUTS: tuple[str, ...] = LAYOUTS_DEFAULT
 
 
 def _init_worker(cam_id: str, tracks: pd.DataFrame, events: pd.DataFrame, cfg: dict) -> None:
@@ -73,10 +76,10 @@ def _worker(job: tuple[str, float, int]) -> dict[str, Any]:
     return result
 
 
-def _jobs() -> list[tuple[str, float, int]]:
+def _jobs(layouts: tuple[str, ...]) -> list[tuple[str, float, int]]:
     return [
         (layout, float(eps_px), seed)
-        for layout in LAYOUTS
+        for layout in layouts
         for eps_px in EPS_PX
         for seed in SEEDS
     ]
@@ -89,9 +92,10 @@ def _run_sweep(
     cfg: dict,
     trial_seconds: float,
     timed_result: dict[str, Any],
+    layouts: tuple[str, ...],
 ) -> list[dict[str, Any]]:
     timed_key = (str(timed_result["layout"]), float(timed_result["eps_px"]), int(timed_result["seed"]))
-    pending = [job for job in _jobs() if job != timed_key]
+    pending = [job for job in _jobs(layouts) if job != timed_key]
     results = [timed_result]
     initargs = (cam_id, tracks, events, cfg)
     if trial_seconds > PARALLEL_IF_SLOWER_THAN_S:
@@ -100,7 +104,7 @@ def _run_sweep(
         with Pool(workers, initializer=_init_worker, initargs=initargs) as pool:
             for result in tqdm(
                 pool.imap_unordered(_worker, pending, chunksize=4),
-                total=len(_jobs()),
+                total=len(_jobs(layouts)),
                 initial=1,
                 desc="trials",
             ):
@@ -108,7 +112,7 @@ def _run_sweep(
     else:
         print(f"One trial takes {trial_seconds:.2f} s. Running sequentially.")
         _init_worker(*initargs)
-        for job in tqdm(pending, total=len(_jobs()), initial=1, desc="trials"):
+        for job in tqdm(pending, total=len(_jobs(layouts)), initial=1, desc="trials"):
             results.append(_worker(job))
     return results
 
@@ -118,10 +122,10 @@ def _group_values(frame: pd.DataFrame, layout: str, eps_px: float, column: str) 
     return frame.loc[mask, column].to_numpy(dtype=float)
 
 
-def _sanity_check_eps0(frame: pd.DataFrame) -> bool:
+def _sanity_check_eps0(frame: pd.DataFrame, layouts: tuple[str, ...]) -> bool:
     print("\nSanity check: eps=0 F1 == 1.0 for every layout")
     ok = True
-    for layout in LAYOUTS:
+    for layout in layouts:
         for event_type in EVENT_TYPES:
             values = _group_values(frame, layout, 0.0, f"f1_{event_type}")
             if len(values) == 0:
@@ -138,9 +142,9 @@ def _sanity_check_eps0(frame: pd.DataFrame) -> bool:
     return ok
 
 
-def _print_summary(frame: pd.DataFrame) -> None:
+def _print_summary(frame: pd.DataFrame, layouts: tuple[str, ...]) -> None:
     print(f"\n{N_TRIALS} trials at each eps, seeds {SEEDS[0]}..{SEEDS[-1]}")
-    for layout in LAYOUTS:
+    for layout in layouts:
         print(f"\n{layout}")
         print(
             f"  {'eps':>5}  "
@@ -164,10 +168,10 @@ def _curve(frame: pd.DataFrame, layout: str, column: str) -> np.ndarray:
     )
 
 
-def _plot_f1(frame: pd.DataFrame, path: Path) -> None:
+def _plot_f1(frame: pd.DataFrame, path: Path, cam_id: str, layouts: tuple[str, ...]) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(12.5, 4.2), sharex=True)
     for ax, event_type in zip(axes, EVENT_TYPES):
-        for layout in LAYOUTS:
+        for layout in layouts:
             ys = _curve(frame, layout, f"f1_{event_type}")
             ax.plot(
                 EPS_PX,
@@ -185,17 +189,24 @@ def _plot_f1(frame: pd.DataFrame, path: Path) -> None:
         ax.set_ylim(0.0, 1.05)
         ax.grid(True, alpha=0.3)
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=4, frameon=False, bbox_to_anchor=(0.5, 1.08))
-    fig.suptitle("C1 event F1 vs calibration noise (number of points)", y=1.14)
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        ncol=len(layouts),
+        frameon=False,
+        bbox_to_anchor=(0.5, 1.08),
+    )
+    fig.suptitle(f"{cam_id} event F1 vs calibration noise (number of points)", y=1.14)
     fig.tight_layout()
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved {path.name}")
 
 
-def _plot_position_error(frame: pd.DataFrame, path: Path) -> None:
+def _plot_position_error(frame: pd.DataFrame, path: Path, cam_id: str, layouts: tuple[str, ...]) -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
-    for layout in LAYOUTS:
+    for layout in layouts:
         ys = _curve(frame, layout, "pos_mean_m")
         ax.plot(
             EPS_PX,
@@ -212,23 +223,26 @@ def _plot_position_error(frame: pd.DataFrame, path: Path) -> None:
     ax.set_ylim(bottom=0.0)
     ax.grid(True, alpha=0.3)
     ax.legend(frameon=False)
-    ax.set_title("C1 position error vs calibration noise (number of points)")
+    ax.set_title(f"{cam_id} position error vs calibration noise (number of points)")
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print(f"Saved {path.name}")
 
 
-def _save_layout_overlay(cam_id: str, path: Path) -> None:
-    """Four panels: each n-point layout drawn on the first frame."""
+def _save_layout_overlay(cam_id: str, path: Path, layouts: tuple[str, ...]) -> None:
+    """Draw each n-point layout on the first frame."""
     import cv2
 
     _image_path, image = _first_frame(cam_id)
     rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     _, corner_pixels = choose_calibration_points(cam_id, layout="n4")
     closed = np.vstack([corner_pixels, corner_pixels[:1]])
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-    for ax, layout in zip(axes.ravel(), LAYOUTS):
+    n = len(layouts)
+    ncols = min(2, n)
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4 * nrows), squeeze=False)
+    for ax, layout in zip(axes.ravel(), layouts):
         world, pixels = choose_calibration_points(cam_id, layout=layout)
         ax.imshow(rgb)
         ax.plot(closed[:, 0], closed[:, 1], color="0.85", linewidth=1.2, linestyle="--")
@@ -248,6 +262,8 @@ def _save_layout_overlay(cam_id: str, path: Path) -> None:
         ax.set_ylim(rgb.shape[0], 0)
         ax.set_xticks([])
         ax.set_yticks([])
+    for ax in axes.ravel()[n:]:
+        ax.axis("off")
     fig.suptitle(f"{cam_id} calibration layouts inside the wide rectangle", y=0.98)
     fig.tight_layout()
     fig.savefig(path, dpi=150, bbox_inches="tight")
@@ -263,9 +279,29 @@ def _column_order(columns: list[str]) -> list[str]:
     return ordered
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cam", default="C1", help="Camera id (default C1)")
+    parser.add_argument(
+        "--layouts",
+        default=None,
+        help="Comma-separated layouts (default: n4,n6,n8,n12 for C1; n4,n12 otherwise)",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
-    cfg = load_event_config(project_root() / "configs" / "events.yaml")
-    cam_id = str(cfg["camera"])
+    args = _parse_args()
+    cam_id = normalize_cam_id(args.cam)
+    if args.layouts:
+        layouts = tuple(part.strip() for part in args.layouts.split(",") if part.strip())
+    elif cam_id == "C1":
+        layouts = LAYOUTS_DEFAULT
+    else:
+        layouts = LAYOUTS_CORE
+    cfg = load_event_config(event_config_path(cam_id))
+    if str(cfg["camera"]) != cam_id:
+        raise ValueError(f"Config camera is {cfg['camera']!r}, expected {cam_id!r}")
     annotations = load_annotations(resolve_dataset_root(DATA_ROOT), cam_id)
     tracks = annotations.loc[annotations["visible"], ["time_sec", "person_id", "X_m", "Y_m"]].copy()
     events = pd.read_csv(project_root() / "outputs" / f"gt_events_{cam_id}.csv")
@@ -273,7 +309,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Warm layout caches and save the overlay before timing trials.
-    for layout in LAYOUTS:
+    for layout in layouts:
         world, pixels = choose_calibration_points(cam_id, layout=layout)
         print(f"{layout}: {len(world)} points")
         print(
@@ -281,14 +317,15 @@ def main() -> None:
             f"[{world[:, 0].min():.1f}, {world[:, 0].max():.1f}]  Y "
             f"[{world[:, 1].min():.1f}, {world[:, 1].max():.1f}]"
         )
-    _save_layout_overlay(cam_id, output_dir / f"calib_points_npoints_{cam_id}.png")
+    _save_layout_overlay(cam_id, output_dir / f"calib_points_npoints_{cam_id}.png", layouts)
 
+    timing_layout = "n8" if "n8" in layouts else layouts[0]
     started = time.perf_counter()
-    timed = run_trial(cam_id, 5.0, 0, tracks, events, cfg, layout="n8")
-    timed["layout"] = "n8"
+    timed = run_trial(cam_id, 5.0, 0, tracks, events, cfg, layout=timing_layout)
+    timed["layout"] = timing_layout
     trial_seconds = time.perf_counter() - started
 
-    results = _run_sweep(cam_id, tracks, events, cfg, trial_seconds, timed)
+    results = _run_sweep(cam_id, tracks, events, cfg, trial_seconds, timed, layouts)
     frame = pd.DataFrame(results)
     frame = frame.sort_values(["layout", "eps_px", "seed"], kind="mergesort").reset_index(drop=True)
     frame = frame[_column_order(list(frame.columns))]
@@ -297,10 +334,12 @@ def main() -> None:
     frame.to_csv(table_path, index=False, float_format="%.6f")
     print(f"Saved {table_path.name} ({len(frame)} rows)")
 
-    _print_summary(frame)
-    _sanity_check_eps0(frame)
-    _plot_f1(frame, output_dir / f"f1_vs_eps_npoints_{cam_id}.png")
-    _plot_position_error(frame, output_dir / f"position_error_vs_eps_npoints_{cam_id}.png")
+    _print_summary(frame, layouts)
+    _sanity_check_eps0(frame, layouts)
+    _plot_f1(frame, output_dir / f"f1_vs_eps_npoints_{cam_id}.png", cam_id, layouts)
+    _plot_position_error(
+        frame, output_dir / f"position_error_vs_eps_npoints_{cam_id}.png", cam_id, layouts
+    )
 
 
 if __name__ == "__main__":
