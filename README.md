@@ -107,7 +107,6 @@ Relative F1 at 10 px = F1(10 px) / F1(0 px). Zone and dwell use anonymous scorin
 | YOLO11x + ByteTrack | 1.01 | 0.83 | 0.97 |
 
 Values slightly above 1 are trial-to-trial noise. Anonymous proximity scoring drops more (0.89–0.92) because it requires the pair's midpoint within 1 m of the true one; widening that gate to 2 m restores the oracle to 0.98. So proximity alarms still fire under calibration error, but the reported location can be off by about 1 m.
-
 ![F1 vs calibration noise on predicted tracks](docs/figures/f1_vs_eps_pred_tracks_C1.png)
 
 ---
