@@ -316,6 +316,84 @@ def _layout_n12(
     return np.column_stack((grid_x.ravel(), grid_y.ravel())).astype(np.float64)
 
 
+# Fixed ground rectangles used by the layout-placement experiment (meters).
+# wide matches the search result of _wide_world_corners on C1.
+LAYOUT_RECTANGLES_M: dict[str, tuple[float, float, float, float]] = {
+    "wide": (-2.0, 8.5, 2.5, 26.5),
+    "narrow": (1.0, 6.0, 9.0, 17.0),
+    "near_only": (-2.0, 8.5, 2.5, 10.0),
+    "far_only": (-2.0, 8.5, 18.0, 26.5),
+}
+
+
+def _rectangle_n4(bounds: tuple[float, float, float, float]) -> WorldLayout:
+    """Return a layout function that places the four corners of `bounds`."""
+
+    def layout(
+        cam_id: str,
+        H: np.ndarray,
+        R: np.ndarray,
+        t: np.ndarray,
+        width: int,
+        height: int,
+    ) -> np.ndarray:
+        return _corners(*bounds)
+
+    return layout
+
+
+def _rectangle_n12(bounds: tuple[float, float, float, float]) -> WorldLayout:
+    """Return a layout function that places a 3 x 4 grid spanning `bounds`."""
+
+    def layout(
+        cam_id: str,
+        H: np.ndarray,
+        R: np.ndarray,
+        t: np.ndarray,
+        width: int,
+        height: int,
+    ) -> np.ndarray:
+        xmin, xmax, ymin, ymax = bounds
+        xs = np.linspace(xmin, xmax, 3)
+        ys = np.linspace(ymin, ymax, 4)
+        grid_x, grid_y = np.meshgrid(xs, ys, indexing="xy")
+        return np.column_stack((grid_x.ravel(), grid_y.ravel())).astype(np.float64)
+
+    return layout
+
+
+def _build_placement_layouts() -> dict[str, WorldLayout]:
+    """Register `<name>` (4 corners) and `<name>_n12` (3 x 4 grid) for each rectangle."""
+    layouts: dict[str, WorldLayout] = {}
+    for name, bounds in LAYOUT_RECTANGLES_M.items():
+        layouts[name] = _rectangle_n4(bounds)
+        layouts[f"{name}_n12"] = _rectangle_n12(bounds)
+    return layouts
+
+
+def corners_project_inside_image(
+    cam_id: str | int,
+    world_pts: np.ndarray,
+    margin: float = 1.0,
+) -> bool:
+    """True when every world point projects in front of the camera and inside the image."""
+    name = normalize_cam_id(cam_id)
+    K, R, t = load_camera_calibration(DATA_ROOT, name)
+    H = ground_homography(K, R, t)
+    _image_path, image = _first_frame(name)
+    height, width = image.shape[:2]
+    xy = np.asarray(world_pts, dtype=np.float64)
+    uv = world_to_image(H, xy)
+    depth = _camera_depth(R, t, xy)
+    return bool(
+        np.all(depth > _MIN_DEPTH_M)
+        and np.all(uv[:, 0] >= margin)
+        and np.all(uv[:, 0] <= width - 1 - margin)
+        and np.all(uv[:, 1] >= margin)
+        and np.all(uv[:, 1] <= height - 1 - margin)
+    )
+
+
 _LAYOUTS: dict[str, WorldLayout] = {
     "wide": _wide_world_corners,
     "n4": _layout_n4,
@@ -323,6 +401,9 @@ _LAYOUTS: dict[str, WorldLayout] = {
     "n8": _layout_n8,
     "n12": _layout_n12,
 }
+_LAYOUTS.update(_build_placement_layouts())
+# wide / wide_n12 from LAYOUT_RECTANGLES_M overwrite the search-based aliases with
+# the same numeric rectangle, so name lookups stay consistent.
 _CALIBRATION_POINT_CACHE: dict[tuple[str, str], tuple[np.ndarray, np.ndarray]] = {}
 _H_STAR_CACHE: dict[str, np.ndarray] = {}
 
@@ -335,8 +416,10 @@ def choose_calibration_points(
 
     layout selects the point placement. "wide" / "n4" are the four corners of
     the walking-area rectangle; "n6", "n8", and "n12" add side midpoints or a
-    3 x 4 grid inside that same rectangle. World points are (N, 2) meters.
-    Pixel points are (N, 2) under H_world_to_img, in the same order.
+    3 x 4 grid inside that same rectangle. Placement variants "narrow",
+    "near_only", and "far_only" (and their "_n12" grids) use the fixed
+    rectangles in LAYOUT_RECTANGLES_M. World points are (N, 2) meters. Pixel
+    points are (N, 2) under H_world_to_img, in the same order.
     """
     name = normalize_cam_id(cam_id)
     if layout not in _LAYOUTS:
