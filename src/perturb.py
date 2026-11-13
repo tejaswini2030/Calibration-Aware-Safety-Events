@@ -233,8 +233,95 @@ def _wide_world_corners(
     return _corners(*chosen)
 
 
+def _wide_rectangle_bounds(
+    cam_id: str,
+    H: np.ndarray,
+    R: np.ndarray,
+    t: np.ndarray,
+    width: int,
+    height: int,
+) -> tuple[float, float, float, float]:
+    """Axis-aligned bounds of the wide calibration rectangle (xmin, xmax, ymin, ymax)."""
+    corners = _wide_world_corners(cam_id, H, R, t, width, height)
+    return (
+        float(corners[:, 0].min()),
+        float(corners[:, 0].max()),
+        float(corners[:, 1].min()),
+        float(corners[:, 1].max()),
+    )
+
+
+def _layout_n4(
+    cam_id: str,
+    H: np.ndarray,
+    R: np.ndarray,
+    t: np.ndarray,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    """Four corners of the wide rectangle (same as layout 'wide')."""
+    return _wide_world_corners(cam_id, H, R, t, width, height)
+
+
+def _layout_n6(
+    cam_id: str,
+    H: np.ndarray,
+    R: np.ndarray,
+    t: np.ndarray,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    """Four corners plus midpoints of the two long sides of the wide rectangle."""
+    xmin, xmax, ymin, ymax = _wide_rectangle_bounds(cam_id, H, R, t, width, height)
+    corners = _corners(xmin, xmax, ymin, ymax)
+    mid_y = 0.5 * (ymin + ymax)
+    # Long sides run along Y for the wide C1 rectangle (24 m vs 10.5 m).
+    mids = np.array([[xmin, mid_y], [xmax, mid_y]], dtype=np.float64)
+    return np.vstack([corners, mids])
+
+
+def _layout_n8(
+    cam_id: str,
+    H: np.ndarray,
+    R: np.ndarray,
+    t: np.ndarray,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    """Four corners plus midpoints of all four sides of the wide rectangle."""
+    xmin, xmax, ymin, ymax = _wide_rectangle_bounds(cam_id, H, R, t, width, height)
+    corners = _corners(xmin, xmax, ymin, ymax)
+    mid_x = 0.5 * (xmin + xmax)
+    mid_y = 0.5 * (ymin + ymax)
+    mids = np.array(
+        [[xmin, mid_y], [xmax, mid_y], [mid_x, ymin], [mid_x, ymax]],
+        dtype=np.float64,
+    )
+    return np.vstack([corners, mids])
+
+
+def _layout_n12(
+    cam_id: str,
+    H: np.ndarray,
+    R: np.ndarray,
+    t: np.ndarray,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    """3 x 4 grid spanning the wide rectangle (3 along X, 4 along Y)."""
+    xmin, xmax, ymin, ymax = _wide_rectangle_bounds(cam_id, H, R, t, width, height)
+    xs = np.linspace(xmin, xmax, 3)
+    ys = np.linspace(ymin, ymax, 4)
+    grid_x, grid_y = np.meshgrid(xs, ys, indexing="xy")
+    return np.column_stack((grid_x.ravel(), grid_y.ravel())).astype(np.float64)
+
+
 _LAYOUTS: dict[str, WorldLayout] = {
     "wide": _wide_world_corners,
+    "n4": _layout_n4,
+    "n6": _layout_n6,
+    "n8": _layout_n8,
+    "n12": _layout_n12,
 }
 _CALIBRATION_POINT_CACHE: dict[tuple[str, str], tuple[np.ndarray, np.ndarray]] = {}
 _H_STAR_CACHE: dict[str, np.ndarray] = {}
@@ -244,12 +331,12 @@ def choose_calibration_points(
     cam_id: str | int,
     layout: str = "wide",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return 4 ground points and their exact pixels under the ground-truth H*.
+    """Return ground points and their exact pixels under the ground-truth H*.
 
-    layout selects the point placement. "wide" covers the walking area.
-    Further layouts (for example "narrow" or "near-only") can be added to
-    _LAYOUTS. World points are (4, 2) meters. Pixel points are (4, 2) under
-    H_world_to_img, in the same order.
+    layout selects the point placement. "wide" / "n4" are the four corners of
+    the walking-area rectangle; "n6", "n8", and "n12" add side midpoints or a
+    3 x 4 grid inside that same rectangle. World points are (N, 2) meters.
+    Pixel points are (N, 2) under H_world_to_img, in the same order.
     """
     name = normalize_cam_id(cam_id)
     if layout not in _LAYOUTS:
