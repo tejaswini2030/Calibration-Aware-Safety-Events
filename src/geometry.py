@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import itertools
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -207,3 +209,109 @@ def normalized_dlt(src_pts: np.ndarray, dst_pts: np.ndarray) -> np.ndarray:
     homography_normalized = vh[-1].reshape(3, 3)
     homography = np.linalg.inv(dst_transform) @ homography_normalized @ src_transform
     return _normalize_homography(homography)
+
+
+def transfer_errors_px(
+    H_img_to_world: np.ndarray,
+    pixels: np.ndarray,
+    world_pts: np.ndarray,
+) -> np.ndarray:
+    """Pixel transfer error of each correspondence under H_img_to_world.
+
+    Maps each world point to the image with the inverse of H_img_to_world and
+    returns the Euclidean distance in pixels to the corresponding clicked pixel.
+    """
+    H_world_to_img = invert_homography(H_img_to_world)
+    predicted = world_to_image(H_world_to_img, world_pts)
+    return np.linalg.norm(predicted - np.asarray(pixels, dtype=np.float64), axis=1)
+
+
+def median_meters_per_pixel(H_img_to_world: np.ndarray, pixels: np.ndarray) -> float:
+    """Median local ground scale (m / px) at the given image points.
+
+    For each pixel, take the mean world displacement of a 1 px step along ±u
+    and ±v. The median over points converts a pixel inlier threshold into
+    meters for estimators that score residuals in the destination frame.
+    """
+    pts = np.asarray(pixels, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 2 or len(pts) == 0:
+        raise ValueError(f"pixels must have shape (N, 2) with N >= 1, got {pts.shape}")
+    scales: list[float] = []
+    offsets = np.array([[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]], dtype=np.float64)
+    for uv in pts:
+        center = image_to_world(H_img_to_world, uv[None, :])[0]
+        step_lengths = []
+        for offset in offsets:
+            moved = image_to_world(H_img_to_world, (uv + offset)[None, :])[0]
+            step_lengths.append(float(np.linalg.norm(moved - center)))
+        scales.append(float(np.mean(step_lengths)))
+    return float(np.median(np.asarray(scales, dtype=np.float64)))
+
+
+def ransac_homography_exhaustive(
+    pixels: np.ndarray,
+    world_pts: np.ndarray,
+    threshold_px: float = 3.0,
+) -> dict[str, Any]:
+    """Exhaustive RANSAC for H_img_to_world over all 4-point subsets.
+
+    Because N is small (for example N = 12 → C(12, 4) = 495), every minimal
+    subset is tried. For each subset, H is fit with normalized_dlt, transfer
+    errors are measured in pixels, and inliers are points with error <=
+    threshold_px. The subset with the most inliers wins; ties break toward
+    the lowest total inlier transfer error. The returned H is a normalized_dlt
+    refit on all inliers of the winning subset.
+
+    Returns a dict with keys:
+      H, inlier_mask (bool, length N), n_inliers, transfer_errors_px.
+    """
+    src = np.asarray(pixels, dtype=np.float64)
+    dst = np.asarray(world_pts, dtype=np.float64)
+    if src.shape != dst.shape or src.ndim != 2 or src.shape[1] != 2:
+        raise ValueError(f"pixels and world_pts must both have shape (N, 2), got {src.shape} and {dst.shape}")
+    n_points = len(src)
+    if n_points < 4:
+        raise ValueError(f"RANSAC needs at least 4 correspondences, got {n_points}")
+    threshold = float(threshold_px)
+    if threshold < 0.0:
+        raise ValueError(f"threshold_px must be non-negative, got {threshold_px}")
+
+    best: tuple[int, float, np.ndarray, np.ndarray] | None = None
+    # (n_inliers, total_inlier_error, inlier_mask, H_subset)
+    for indices in itertools.combinations(range(n_points), 4):
+        try:
+            H_subset = normalized_dlt(src[list(indices)], dst[list(indices)])
+            errors = transfer_errors_px(H_subset, src, dst)
+        except (ValueError, np.linalg.LinAlgError):
+            continue
+        mask = errors <= threshold
+        n_inliers = int(mask.sum())
+        if n_inliers < 4:
+            continue
+        total_error = float(errors[mask].sum())
+        # Maximize inliers; on ties minimize total inlier error.
+        candidate = (n_inliers, -total_error, mask, H_subset)
+        if best is None or (candidate[0], candidate[1]) > (best[0], best[1]):
+            best = (n_inliers, -total_error, mask, H_subset)
+
+    if best is None:
+        # Degenerate input: fall back to a least-squares fit on everything.
+        H = normalized_dlt(src, dst)
+        errors = transfer_errors_px(H, src, dst)
+        mask = np.ones(n_points, dtype=bool)
+        return {
+            "H": H,
+            "inlier_mask": mask,
+            "n_inliers": n_points,
+            "transfer_errors_px": errors,
+        }
+
+    n_inliers, _neg_error, inlier_mask, _H_subset = best
+    H = normalized_dlt(src[inlier_mask], dst[inlier_mask])
+    errors = transfer_errors_px(H, src, dst)
+    return {
+        "H": H,
+        "inlier_mask": inlier_mask,
+        "n_inliers": int(n_inliers),
+        "transfer_errors_px": errors,
+    }
