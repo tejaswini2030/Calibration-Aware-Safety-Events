@@ -80,3 +80,34 @@ def test_perturb_pixels_is_determined_by_the_rng_seed() -> None:
     assert np.array_equal(first, second)
     other = perturb_pixels(pixels, 3.0, np.random.default_rng(8))
     assert not np.array_equal(first, other)
+
+
+
+def test_npoint_layouts_sit_inside_wide_rectangle() -> None:
+    """n4/n6/n8/n12 use the wide rectangle; counts and bounds match the design."""
+    wide, _ = choose_calibration_points("C1", layout="wide")
+    n4, _ = choose_calibration_points("C1", layout="n4")
+    assert np.allclose(n4, wide)
+    assert n4.shape == (4, 2)
+
+    xmin, xmax = float(wide[:, 0].min()), float(wide[:, 0].max())
+    ymin, ymax = float(wide[:, 1].min()), float(wide[:, 1].max())
+    expected_counts = {"n6": 6, "n8": 8, "n12": 12}
+    for layout, count in expected_counts.items():
+        world, pixels = choose_calibration_points("C1", layout=layout)
+        assert world.shape == (count, 2)
+        assert pixels.shape == (count, 2)
+        assert np.all(world[:, 0] >= xmin - 1e-9) and np.all(world[:, 0] <= xmax + 1e-9)
+        assert np.all(world[:, 1] >= ymin - 1e-9) and np.all(world[:, 1] <= ymax + 1e-9)
+
+    n6, _ = choose_calibration_points("C1", layout="n6")
+    mid_y = 0.5 * (ymin + ymax)
+    assert any(np.isclose(n6[:, 0], xmin) & np.isclose(n6[:, 1], mid_y))
+    assert any(np.isclose(n6[:, 0], xmax) & np.isclose(n6[:, 1], mid_y))
+
+    n12, _ = choose_calibration_points("C1", layout="n12")
+    xs = np.unique(np.round(n12[:, 0], 9))
+    ys = np.unique(np.round(n12[:, 1], 9))
+    assert len(xs) == 3 and len(ys) == 4
+    assert np.isclose(xs[0], xmin) and np.isclose(xs[-1], xmax)
+    assert np.isclose(ys[0], ymin) and np.isclose(ys[-1], ymax)
