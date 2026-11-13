@@ -1,0 +1,43 @@
+# Event logic for camera C6. World coordinates are meters on Z = 0.
+# Each zone is a 3 m x 3 m rectangle. All four corners project inside the
+# C6 frame under the ground-truth homography and lie inside the annotated
+# area. Ground distance from the C6 camera (X, Y) to the zone center:
+# near 8.00 m, medium 24.70 m, far 32.47 m.
+
+camera: C6
+fps: 2
+
+# inside_calibration_hull is true when the whole zone lies in the convex hull
+# of the wide-layout calibration points. The boundary counts as inside.
+zones:
+  - id: near
+    name: Near
+    inside_calibration_hull: false
+    polygon:
+      - [2.0, -6.0]
+      - [5.0, -6.0]
+      - [5.0, -3.0]
+      - [2.0, -3.0]
+  - id: medium
+    name: Medium
+    inside_calibration_hull: true
+    polygon:
+      - [5.5, 11.0]
+      - [8.5, 11.0]
+      - [8.5, 14.0]
+      - [5.5, 14.0]
+  - id: far
+    name: Far
+    inside_calibration_hull: true
+    polygon:
+      - [1.5, 20.0]
+      - [4.5, 20.0]
+      - [4.5, 23.0]
+      - [1.5, 23.0]
+
+zone_hysteresis_m: 0.1
+proximity_threshold_m: 1.5
+proximity_hysteresis_m: 0.1
+dwell_seconds: 2.0
+debounce_frames: 2
+max_gap_frames: 1

@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Camera-bump sweep on C1 ground-truth tracks.
+"""Camera-bump sweep on ground-truth tracks.
 
 After calibration, the camera is rotated by a small angle about one axis of
 its own frame (pitch / yaw / roll). True feet are projected with the bumped
 pose; the system still lifts them with the original H*_img_to_world. Existing
-sweep CSV files are not modified.
+sweep CSV files are not modified. Pass --cam C6 --axes pitch for the
+second-camera pitch-only study.
 """
 
 from __future__ import annotations
 
+import argparse
 import math
 import os
 import sys
@@ -28,12 +30,13 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.data import DATA_ROOT, load_annotations, project_root, resolve_dataset_root
+from src.data import DATA_ROOT, load_annotations, normalize_cam_id, project_root, resolve_dataset_root
 from src.evaluation import score_events
 from src.events import (
     detect_dwell_events,
     detect_proximity_events,
     detect_zone_events,
+    event_config_path,
     load_event_config,
     signed_distance_to_polygon,
 )
@@ -45,7 +48,8 @@ from src.geometry import (
     world_to_image,
 )
 
-AXES = ("pitch", "yaw", "roll")
+AXES_DEFAULT = ("pitch", "yaw", "roll")
+AXES = AXES_DEFAULT
 # Camera-frame axes (OpenCV): X right, Y down, Z forward.
 AXIS_VECTORS = {
     "pitch": np.array([1.0, 0.0, 0.0], dtype=np.float64),  # tilt up/down
@@ -202,8 +206,8 @@ def run_bump_trial(
     return result
 
 
-def _jobs() -> list[tuple[str, float, int]]:
-    return [(axis, float(angle), seed) for axis in AXES for angle in ANGLES_DEG for seed in SEEDS]
+def _jobs(axes: tuple[str, ...]) -> list[tuple[str, float, int]]:
+    return [(axis, float(angle), seed) for axis in axes for angle in ANGLES_DEG for seed in SEEDS]
 
 
 def _worker(job: tuple[str, float, int]) -> dict[str, Any]:
@@ -218,10 +222,10 @@ def _group(frame: pd.DataFrame, axis: str, angle: float, column: str) -> np.ndar
     return frame.loc[mask, column].to_numpy(dtype=float)
 
 
-def _sanity_check(frame: pd.DataFrame) -> bool:
+def _sanity_check(frame: pd.DataFrame, axes: tuple[str, ...]) -> bool:
     print("\nSanity check: angle 0 → F1 = 1.0 for every axis")
     ok = True
-    for axis in AXES:
+    for axis in axes:
         for event_type in EVENT_TYPES:
             values = _group(frame, axis, 0.0, f"f1_{event_type}")
             if len(values) == 0 or not np.allclose(values, 1.0, atol=1e-9):
@@ -241,9 +245,9 @@ def _print_equivalent_shifts(focal_px: float) -> None:
         print(f"  {angle:10g}  {equivalent_pixel_shift(focal_px, angle):10.3f}")
 
 
-def _print_summary(frame: pd.DataFrame) -> None:
+def _print_summary(frame: pd.DataFrame, axes: tuple[str, ...]) -> None:
     print(f"\n{N_TRIALS} trials per (axis, angle), seeds {SEEDS[0]}..{SEEDS[-1]}")
-    for axis in AXES:
+    for axis in axes:
         print(f"\n{axis}")
         print(
             f"  {'ang':>6}  "
@@ -269,10 +273,10 @@ def _print_summary(frame: pd.DataFrame) -> None:
             )
 
 
-def _plot_f1(frame: pd.DataFrame, path: Path) -> None:
-    fig, axes = plt.subplots(1, 3, figsize=(12.5, 4.2), sharey=True)
-    for ax, event_type in zip(axes, EVENT_TYPES):
-        for axis in AXES:
+def _plot_f1(frame: pd.DataFrame, path: Path, cam_id: str, axes: tuple[str, ...]) -> None:
+    fig, axes_plot = plt.subplots(1, 3, figsize=(12.5, 4.2), sharey=True)
+    for ax, event_type in zip(axes_plot, EVENT_TYPES):
+        for axis in axes:
             ys = [
                 float(np.nanmean(_group(frame, axis, float(angle), f"f1_{event_type}")))
                 for angle in ANGLES_DEG
@@ -292,19 +296,27 @@ def _plot_f1(frame: pd.DataFrame, path: Path) -> None:
         ax.set_xlim(-0.02, 1.05)
         ax.set_ylim(0.0, 1.05)
         ax.grid(True, alpha=0.3)
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=3, frameon=False, bbox_to_anchor=(0.5, 1.08))
-    fig.suptitle("C1 event F1 vs camera bump", y=1.14)
+    handles, labels = axes_plot[0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        ncol=len(axes),
+        frameon=False,
+        bbox_to_anchor=(0.5, 1.08),
+    )
+    fig.suptitle(f"{cam_id} event F1 vs camera bump", y=1.14)
     fig.tight_layout()
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved {path.name}")
 
 
-def _plot_position(frame: pd.DataFrame, path: Path) -> None:
+def _plot_position(frame: pd.DataFrame, path: Path, cam_id: str, axes: tuple[str, ...]) -> None:
     scopes = [("overall", "pos_mean_m")] + [(z, f"pos_mean_m_{z}") for z in ZONE_IDS]
-    fig, axes = plt.subplots(1, 3, figsize=(12.5, 4.2), sharey=True)
-    for ax, axis in zip(axes, AXES):
+    n = len(axes)
+    fig, axes_plot = plt.subplots(1, n, figsize=(max(4.2 * n, 5), 4.2), sharey=True, squeeze=False)
+    for ax, axis in zip(axes_plot.ravel(), axes):
         for label, column in scopes:
             ys = [
                 float(np.nanmean(_group(frame, axis, float(angle), column)))
@@ -327,7 +339,7 @@ def _plot_position(frame: pd.DataFrame, path: Path) -> None:
         ax.set_ylim(bottom=0.0)
         ax.grid(True, alpha=0.3)
         ax.legend(frameon=False, fontsize=7)
-    fig.suptitle("C1 position error vs camera bump")
+    fig.suptitle(f"{cam_id} position error vs camera bump")
     fig.tight_layout()
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -342,9 +354,33 @@ def _column_order(columns: list[str]) -> list[str]:
     return ordered
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cam", default="C1", help="Camera id (default C1)")
+    parser.add_argument(
+        "--axes",
+        default=None,
+        help="Comma-separated axes (default: pitch,yaw,roll for C1; pitch otherwise)",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
-    cfg = load_event_config(project_root() / "configs" / "events.yaml")
-    cam_id = str(cfg["camera"])
+    args = _parse_args()
+    cam_id = normalize_cam_id(args.cam)
+    if args.axes:
+        axes = tuple(part.strip() for part in args.axes.split(",") if part.strip())
+    elif cam_id == "C1":
+        axes = AXES_DEFAULT
+    else:
+        axes = ("pitch",)
+    for axis in axes:
+        if axis not in AXIS_VECTORS:
+            raise ValueError(f"Unknown axis {axis!r}. Expected one of {AXES_DEFAULT}")
+
+    cfg = load_event_config(event_config_path(cam_id))
+    if str(cfg["camera"]) != cam_id:
+        raise ValueError(f"Config camera is {cfg['camera']!r}, expected {cam_id!r}")
     annotations = load_annotations(resolve_dataset_root(DATA_ROOT), cam_id)
     tracks = annotations.loc[annotations["visible"], ["time_sec", "person_id", "X_m", "Y_m"]].copy()
     events = pd.read_csv(project_root() / "outputs" / f"gt_events_{cam_id}.csv")
@@ -353,14 +389,14 @@ def main() -> None:
     H_star_w2i = ground_homography(K, R, t)
     H_star_i2w = invert_homography(H_star_w2i)
     focal_px = float(0.5 * (K[0, 0] + K[1, 1]))
-    print(f"C1 focal length (mean fx, fy): {focal_px:.2f} px")
+    print(f"{cam_id} focal length (mean fx, fy): {focal_px:.2f} px")
     _print_equivalent_shifts(focal_px)
 
     started = time.perf_counter()
     timed = run_bump_trial("pitch", 0.5, 0, K, R, t, H_star_i2w, tracks, events, cfg)
     trial_seconds = time.perf_counter() - started
     timed_key = ("pitch", 0.5, 0)
-    pending = [job for job in _jobs() if job != timed_key]
+    pending = [job for job in _jobs(axes) if job != timed_key]
     results = [timed]
 
     initargs = (K, R, t, H_star_i2w, tracks, events, cfg)
@@ -370,7 +406,7 @@ def main() -> None:
         with Pool(workers, initializer=_init_worker, initargs=initargs) as pool:
             for result in tqdm(
                 pool.imap_unordered(_worker, pending, chunksize=4),
-                total=len(_jobs()),
+                total=len(_jobs(axes)),
                 initial=1,
                 desc="trials",
             ):
@@ -378,7 +414,7 @@ def main() -> None:
     else:
         print(f"One trial takes {trial_seconds:.2f} s. Running sequentially.")
         _init_worker(*initargs)
-        for job in tqdm(pending, total=len(_jobs()), initial=1, desc="trials"):
+        for job in tqdm(pending, total=len(_jobs(axes)), initial=1, desc="trials"):
             results.append(_worker(job))
 
     frame = pd.DataFrame(results)
@@ -391,10 +427,10 @@ def main() -> None:
     frame.to_csv(table_path, index=False, float_format="%.6f")
     print(f"Saved {table_path.name} ({len(frame)} rows)")
 
-    _print_summary(frame)
-    _sanity_check(frame)
-    _plot_f1(frame, output_dir / f"f1_vs_bump_{cam_id}.png")
-    _plot_position(frame, output_dir / f"position_error_vs_bump_{cam_id}.png")
+    _print_summary(frame, axes)
+    _sanity_check(frame, axes)
+    _plot_f1(frame, output_dir / f"f1_vs_bump_{cam_id}.png", cam_id, axes)
+    _plot_position(frame, output_dir / f"position_error_vs_bump_{cam_id}.png", cam_id, axes)
 
 
 if __name__ == "__main__":

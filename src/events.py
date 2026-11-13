@@ -11,6 +11,8 @@ import pandas as pd
 import yaml
 from matplotlib.path import Path as PolygonPath
 
+from src.data import normalize_cam_id, project_root
+
 _REQUIRED_KEYS = (
     "camera",
     "fps",
@@ -22,6 +24,14 @@ _REQUIRED_KEYS = (
     "debounce_frames",
     "max_gap_frames",
 )
+
+
+def event_config_path(cam_id: str | int) -> Path:
+    """Return configs/events.yaml for C1, else configs/events_<cam>.yaml."""
+    name = normalize_cam_id(cam_id)
+    if name == "C1":
+        return project_root() / "configs" / "events.yaml"
+    return project_root() / "configs" / f"events_{name}.yaml"
 
 
 def load_event_config(path: str | Path) -> dict[str, Any]:
