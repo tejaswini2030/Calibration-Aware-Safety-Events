@@ -32,6 +32,7 @@ Completed experiments:
 3. **Calibration and perception errors overlap rather than stack up.** With real trackers, 10 px of calibration noise costs zone alarms almost nothing (97–100% of F1 kept) and dwell about 15%.
 4. **Proximity is the most robust event and dwell the most fragile,** with perfect tracks and with real ones. Homography error is spatially smooth, so two nearby people are shifted almost identically. Dwell stacks a space and a time threshold, and most visits last only 2–3 s.
 5. **Distance from the camera dominates position error,** more than extrapolating outside the calibration rectangle (at 10 px: 0.22 m near, 0.63 m far).
+6. **More calibration points are a cheap fix.** Going from 4 to 12 points halves position error and makes zone alarms tolerate twice the clicking error; dwell goes from 1 px to 3 px.
 
 ## Results
 
@@ -108,6 +109,20 @@ Relative F1 at 10 px = F1(10 px) / F1(0 px). Zone and dwell use anonymous scorin
 
 Values slightly above 1 are trial-to-trial noise. Anonymous proximity scoring drops more (0.89–0.92) because it requires the pair's midpoint within 1 m of the true one; widening that gate to 2 m restores the oracle to 0.98. So proximity alarms still fire under calibration error, but the reported location can be off by about 1 m.
 ![F1 vs calibration noise on predicted tracks](docs/figures/f1_vs_eps_pred_tracks_C1.png)
+
+### 5. Mitigation: more calibration points
+
+Adding calibration correspondences is a cheap and effective mitigation. Moving from the minimal 4 points to 12 points spread across the plaza halves the mean position error at a given click noise (0.43 m → 0.22 m at 10 px), roughly in line with least-squares averaging. At the event level, this raises the tolerated click error from 5 px to at least 10 px for zone alarms and from 1 px to 3 px for dwell alarms (mean F1 ≥ 0.95). In practical terms, clicking three times as many points is worth about as much as halving the clicking error. Dwell remains the event that most constrains calibration quality.
+
+**Calibration-tolerance guideline (F1 ≥ 0.95, perfect tracks)**
+
+| Event | 4 points: average | 4 points: worst 5% | 12 points: average | 12 points: worst 5% |
+|---|---:|---:|---:|---:|
+| Proximity | ≥ 10 px | 5 px | ≥ 10 px | ≥ 10 px |
+| Zone | 5 px | 3 px | ≥ 10 px | 5 px |
+| Dwell | 1 px | < 1 px | 3 px | 1 px |
+
+Tested noise levels: 0, 1, 2, 3, 5 and 10 px, 100 trials each. Layouts n4, n6, n8 and n12 all lie inside the same rectangle (`scripts/run_sweep_npoints.py`).
 
 ---
 
@@ -196,6 +211,7 @@ python scripts/check_zero_noise.py
 
 # 4. Calibration sweep on ground-truth tracks (5 noise levels × 200 trials)
 python scripts/run_sweep.py               # → outputs/sweep_C1_gt_tracks.csv and plots
+python scripts/run_sweep_npoints.py       # → outputs/sweep_C1_npoints.csv, tolerance_npoints_C1.csv and plots
 
 # 5. Detection and tracking
 python scripts/run_detection.py --device mps   # → results/detections/det_C1_{yolo11n,yolo11x}.csv
@@ -301,7 +317,7 @@ Dwell fires when a zone visit lasts at least `dwell_seconds`; the alarm starts a
 - [ ] Add ε = 2 px for a finer guideline
 - [ ] Foot point: box bottom-center vs pose-model ankles
 - [ ] Camera bump (small rotations) and calibration-layout experiments
-- [ ] More than 4 points as a mitigation
+- [x] More than 4 points as a mitigation
 - [ ] 2–3 more cameras with different viewing angles
 
 ## References
