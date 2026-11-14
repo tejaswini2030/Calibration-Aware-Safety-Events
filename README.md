@@ -259,9 +259,22 @@ outputs/              results and plots (gitignored)
 docs/figures/         selected plots committed for this README
 ```
 
+## Reproduce everything
+
+From the repository root, with the dataset at `data/Wildtrack_dataset` and the venv activated (or present at `.venv/`):
+
+```bash
+./run_all.sh --skip-perception          # reuse results/ detections and tracks
+./run_all.sh --device mps               # full run, including YOLO + trackers
+./run_all.sh --skip-perception --device cpu
+./run_all.sh --skip-perception --resume # also keep sweep_C1_pred_tracks.csv checkpoint
+```
+
+`run_all.sh` runs tests, checks, C1/C6 zones and answer keys, all calibration sweeps, perception (unless skipped), track scoring and predicted-track sweeps, then report figures. It uses `set -euo pipefail`, writes each step’s stdout/stderr to `outputs/logs/<step>.log`, prints a one-line PASS/FAIL with timing per step, and ends with a summary table. `--skip-perception` reuses the committed CSVs in `results/` so you can skip YOLO and DeepSORT (~9 min per detector). By default it passes `--force` to `run_sweep_tracks.py` so the predicted-track sweep recomputes from scratch; `--resume` keeps the checkpoint and only fills missing trials.
+
 ## Running the pipeline
 
-Run from the repository root.
+Run from the repository root. The steps below are the same order as `run_all.sh` (grouped for reading); prefer `./run_all.sh` when you want a full rebuild.
 
 ```bash
 # 1. Checks: dataset, calibration, geometry on all 7 cameras

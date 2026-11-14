@@ -8,10 +8,14 @@ through geometry, not through rematching. Zone and dwell use the full
 on-ground feet; proximity uses the 1 m-inset inner area, matching
 scripts/run_events_on_tracks.py. Each trial is scored with both identity and
 anonymous matching.
+
+Writes outputs/sweep_C1_pred_tracks.csv as a checkpoint so a killed run can
+resume. Pass --force to delete that file and recompute every trial.
 """
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import os
 import sys
@@ -147,8 +151,17 @@ def _load_completed(path: Path) -> dict[tuple[str, float, int], dict[str, Any]]:
             continue
         key = (str(row["model"]), eps, seed)
         done[key] = row
-    print(f"Resuming from {path.name}: {len(done)} computed trials already on disk")
     return done
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Ignore/delete the checkpoint CSV and recompute every trial",
+    )
+    return parser.parse_args()
 
 
 def _checkpoint(path: Path, results: list[dict[str, Any]]) -> None:
@@ -546,6 +559,7 @@ def _load_models(tracks_dir: Path, cam_id: str, annotations: pd.DataFrame) -> di
 
 
 def main() -> None:
+    args = _parse_args()
     cfg = load_event_config(project_root() / "configs" / "events.yaml")
     cam_id = normalize_cam_id(str(cfg["camera"]))
     margin = float(DEFAULT_BOUNDARY_MARGIN_M)
@@ -569,7 +583,26 @@ def main() -> None:
     models = list(model_feet.keys())
 
     table_path = output_dir / f"sweep_{cam_id}_pred_tracks.csv"
-    completed = _load_completed(table_path)
+    n_jobs = len(_jobs(models))
+    if args.force:
+        if table_path.is_file():
+            table_path.unlink()
+            print(
+                f"FORCE: deleted checkpoint {table_path.name}; "
+                f"recomputing all {n_jobs} trials from scratch."
+            )
+        else:
+            print(f"FORCE: no checkpoint present; computing all {n_jobs} trials from scratch.")
+        completed = {}
+    else:
+        completed = _load_completed(table_path)
+        if completed:
+            print(
+                f"RESUME: loading {table_path.name} "
+                f"({len(completed)} of {n_jobs} computed trials already on disk)."
+            )
+        else:
+            print(f"COMPUTE: no checkpoint at {table_path.name}; running all {n_jobs} trials.")
 
     timed_model = models[1] if len(models) > 1 else models[0]
     timed_key = (timed_model, 5.0, 0)
